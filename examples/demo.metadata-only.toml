@@ -1,0 +1,73 @@
+[event_search]
+limit = 12
+selected_event_tokens = []
+timeout = 30
+max_request_attempts = 3
+sleep_seconds = 1.0
+
+[event_search.query]
+starttime = "1990-01-01T00:00:00"
+endtime = "1990-12-31T23:59:59"
+minmagnitude = 6.5
+maxmagnitude = 9.9
+minlatitude = -90.0
+maxlatitude = 90.0
+minlongitude = -180.0
+maxlongitude = 180.0
+orderby = "time-asc"
+limit = 500
+output = "text"
+
+[request]
+channels = "BH?"
+networks = ""
+stations = ""
+location_priority = "00,--,10"
+min_distance_deg = 35.0
+max_distance_deg = 95.0
+min_azimuth_deg = -180.0
+max_azimuth_deg = 180.0
+window_start_before_min = 2
+window_start_phase = "P"
+window_end_after_min = 5
+window_end_phase = "P"
+output_format = "sacbl"
+bundle = "tar"
+user = "Demo User"
+email = "your_qq_mail@qq.com"
+request_label_prefix = "wilberflow_demo"
+submit = false
+metadata_only = true
+skip_find_stations_prefetch = false
+timeout = 30
+sleep_seconds = 0.3
+max_request_attempts = 5
+
+[mail]
+imap_host = "imap.qq.com"
+imap_port = 993
+imap_timeout_seconds = 30
+imap_user_env = "QQ_IMAP_USER"
+imap_password_env = "QQ_IMAP_AUTH_CODE"
+mailbox = "INBOX"
+subject_substring = "[Success]"
+from_substring = "wilber"
+poll_interval_seconds = 30
+max_wait_minutes = 15
+message_lookback_hours = 24
+max_messages = 1500
+prefer_https = true
+
+[download]
+overwrite = false
+chunk_size_bytes = 1048576
+timeout = 120
+
+[normalize]
+pre_filt = "0.002,0.005,2.0,4.0"
+output_unit = "VEL"
+routing_type = "earthscope-federator"
+response_backend = "local_sac_first"
+overwrite = false
+selected_event_ids = []
+limit_events = 0

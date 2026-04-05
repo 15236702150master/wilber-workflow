@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WilberFlow | Config Studio</title>
+    <meta
+      name="description"
+      content="A compact GitHub Pages-ready configuration studio for Wilber event filtering, station selection, request generation, and final export."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%2312263f'/%3E%3Cpath d='M14 41c6-2 10-6 14-18 3 11 6 15 10 15 4 0 6-4 12-16' fill='none' stroke='%23fff9ef' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <main class="studio-shell" id="configurator">
+        <div class="topbar">
+          <div>
+            <p class="eyebrow">WilberFlow / Config Studio</p>
+            <h1>配置台</h1>
+          </div>
+          <div class="status-chip" id="storage-status">准备就绪</div>
+        </div>
+
+        <div class="workspace-grid">
+          <section class="config-column">
+            <div class="profile-bar">
+              <label class="compact-field" data-help-key="profile_select">
+                <span>当前配置档</span>
+                <select id="profile-select"></select>
+              </label>
+              <label class="compact-field compact-grow" data-help-key="profile_name">
+                <span>配置档名称</span>
+                <input id="profile-name" type="text" placeholder="例如：Winner / Mexico / Demo Batch" />
+              </label>
+              <div class="profile-actions">
+                <button class="button button-primary" id="save-profile" type="button">保存配置档</button>
+                <button class="button button-secondary" id="reset-profile" type="button">恢复默认</button>
+                <button class="button button-secondary" id="delete-profile" type="button">删除当前</button>
+                <button class="button button-secondary" id="import-config" type="button">导入配置</button>
+                <button class="button button-secondary" id="export-toml" type="button">导出 config.toml</button>
+                <button class="button button-secondary" id="export-json" type="button">导出 JSON</button>
+                <input id="import-config-file" type="file" accept=".json,.toml,.tml,application/json,text/plain" hidden />
+              </div>
+            </div>
+
+            <section class="workflow-panel" aria-live="polite">
+              <div class="workflow-panel-head">
+                <div>
+                  <p class="eyebrow">Workflow Status</p>
+                  <h2>流程状态</h2>
+                </div>
+                <div class="mini-status workflow-status-badge" id="workflow-status">等待运行</div>
+              </div>
+              <div class="workflow-stagebar" id="workflow-stagebar"></div>
+            </section>
+
+            <form id="settings-form" class="config-grid">
+              <article class="config-card" data-step="events">
+                <div class="card-head">
+                  <p class="eyebrow">Step 1</p>
+                  <h2>事件</h2>
+                </div>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>Wilber 数据集</span>
+                    <select name="event_dataset" id="event-dataset"></select>
+                  </label>
+                  <div class="field span-full action-field">
+                    <div class="inline-actions">
+                      <button class="button button-primary" id="search-events" type="button">搜索 Wilber 事件</button>
+                      <div class="mini-status" id="event-search-status">等待搜索</div>
+                    </div>
+                  </div>
+                  <label class="field">
+                    <span>开始时间 UTC</span>
+                    <input name="event_start_utc" type="datetime-local" />
+                  </label>
+                  <label class="field">
+                    <span>结束时间 UTC</span>
+                    <input name="event_end_utc" type="datetime-local" />
+                  </label>
+                  <label class="field">
+                    <span>最小震级</span>
+                    <input name="min_magnitude" type="number" step="0.1" />
+                  </label>
+                  <label class="field">
+                    <span>最大震级</span>
+                    <input name="max_magnitude" type="number" step="0.1" />
+                  </label>
+                  <label class="field">
+                    <span>最小深度 km</span>
+                    <input name="min_depth_km" type="number" step="1" />
+                  </label>
+                  <label class="field">
+                    <span>最大深度 km</span>
+                    <input name="max_depth_km" type="number" step="1" />
+                  </label>
+                  <label class="field">
+                    <span>纬度范围</span>
+                    <input name="latitude_range" type="text" placeholder="-60, 60" />
+                  </label>
+                  <label class="field">
+                    <span>经度范围</span>
+                    <input name="longitude_range" type="text" placeholder="-180, 180" />
+                  </label>
+                  <label class="field">
+                    <span>限制事件数量</span>
+                    <input name="limit_events" type="number" step="1" min="0" placeholder="0 表示不限制" />
+                  </label>
+                  <label class="field">
+                    <span>事件名单（可手动增删）</span>
+                    <textarea
+                      name="selected_event_tokens"
+                      rows="4"
+                      placeholder="支持批量粘贴，每行或逗号分隔，例如：&#10;1996_01_01_08_05_09&#10;24554&#10;1996-01-17T10:06:44"
+                    ></textarea>
+                  </label>
+                  <div class="field span-full action-field">
+                    <div class="mini-status" id="selected-events-status">搜索后会默认全选结果，并同步写入事件名单</div>
+                  </div>
+                  <input name="selected_regions" type="hidden" />
+                  <label class="field span-full" data-help-key="selected_regions">
+                    <span>地区筛选</span>
+                    <details class="catalog-dropdown" id="region-filter-dropdown">
+                      <summary>
+                        <span id="region-filter-summary">从当前搜索结果地区里筛选</span>
+                      </summary>
+                      <div class="catalog-dropdown-panel">
+                        <div class="catalog-toolbar">
+                          <input id="region-filter-search" type="search" placeholder="搜索地区名称，例如 Fiji / Alaska / Chile" />
+                          <div class="catalog-actions">
+                            <button class="button button-secondary" id="region-select-visible" type="button">选中当前搜索结果</button>
+                            <button class="button button-secondary" id="region-clear-selection" type="button">清空地区</button>
+                            <button class="button button-secondary" id="region-close-dropdown" type="button">确定</button>
+                          </div>
+                        </div>
+                        <div class="mini-status catalog-status" id="region-filter-status">搜索 Wilber 事件后会在这里列出所有地区，默认全选</div>
+                        <div class="region-filter-list" id="region-filter-list"></div>
+                      </div>
+                    </details>
+                  </label>
+                  <label class="field checkbox-field span-full">
+                    <input name="metadata_only" type="checkbox" />
+                    <span>仅生成事件与台站 CSV，不提交下载</span>
+                  </label>
+                  <div class="field span-full">
+                    <span>Wilber 搜索结果</span>
+                    <div class="event-results" id="event-results"></div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="config-card" data-step="stations">
+                <div class="card-head">
+                  <p class="eyebrow">Step 2</p>
+                  <h2>台站</h2>
+                </div>
+                <div class="field-grid">
+                  <label class="field span-full">
+                    <span>网络通配符</span>
+                    <div class="catalog-field">
+                      <input name="network_patterns" type="text" placeholder="留空表示每个事件都全台网；也可手动输入 IU,II,G,GT,CN,GE" />
+                      <details class="catalog-dropdown" id="network-catalog-dropdown">
+                        <summary>
+                          <span id="network-catalog-summary">从常用台网目录选择</span>
+                        </summary>
+                        <div class="catalog-dropdown-panel">
+                          <div class="catalog-toolbar">
+                            <input id="network-catalog-search" type="search" placeholder="搜索台网代码或名称，例如 IU / Global / Australia" />
+                            <div class="catalog-actions">
+                              <button class="button button-secondary" id="network-select-visible" type="button">选中当前搜索结果</button>
+                              <button class="button button-secondary" id="network-clear-selection" type="button">清空选择</button>
+                              <button class="button button-secondary" id="network-close-dropdown" type="button">确定</button>
+                            </div>
+                          </div>
+                          <div class="mini-status catalog-status" id="network-catalog-status">正在准备常用台网目录...</div>
+                          <div class="network-catalog-list" id="network-catalog-list"></div>
+                        </div>
+                      </details>
+                    </div>
+                  </label>
+                  <label class="field">
+                    <span>台站通配符</span>
+                    <input name="station_patterns" type="text" placeholder="例如 ANMO,COLA,A*；留空表示不过滤" />
+                  </label>
+                  <label class="field">
+                    <span>通道通配符</span>
+                    <div class="pattern-field">
+                      <input name="channel_patterns" type="text" placeholder="BHZ" />
+                      <details class="pattern-picker" data-target-input="channel_patterns" data-default-summary="从 Wilber 通道分类里选择">
+                        <summary><span class="pattern-summary">从 Wilber 通道分类里选择</span></summary>
+                        <div class="pattern-menu"></div>
+                      </details>
+                    </div>
+                  </label>
+                  <label class="field">
+                    <span>location 优先级</span>
+                    <input name="location_priority" type="text" placeholder="00,--,10" />
+                  </label>
+                  <label class="field">
+                    <span>最小震中距</span>
+                    <input name="min_distance_deg" type="number" step="0.1" />
+                  </label>
+                  <label class="field">
+                    <span>最大震中距</span>
+                    <input name="max_distance_deg" type="number" step="0.1" />
+                  </label>
+                  <label class="field">
+                    <span>最小方位角</span>
+                    <input name="min_azimuth_deg" type="number" step="0.1" />
+                  </label>
+                  <label class="field">
+                    <span>最大方位角</span>
+                    <input name="max_azimuth_deg" type="number" step="0.1" />
+                  </label>
+                </div>
+              </article>
+
+              <article class="config-card" data-step="request">
+                <div class="card-head">
+                  <p class="eyebrow">Step 3</p>
+                  <h2>表单</h2>
+                </div>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>请求用户名</span>
+                    <input name="request_user" type="text" placeholder="Your Name" />
+                  </label>
+                  <label class="field">
+                    <span>接收邮箱 / QQ邮箱</span>
+                    <input name="request_email" type="email" placeholder="your_mail@qq.com" />
+                    <div class="field-note" id="request-email-note"></div>
+                  </label>
+                  <label class="field">
+                    <span>RequestLabel 前缀</span>
+                    <input name="request_label_prefix" type="text" placeholder="wilberflow_batch" />
+                  </label>
+                  <label class="field">
+                    <span>窗口起点相位</span>
+                    <select name="window_start_phase">
+                      <option value="P">P</option>
+                      <option value="S">S</option>
+                      <option value="">Origin</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>窗口起点提前</span>
+                    <select name="before_arrival_sec" id="before-arrival-select"></select>
+                  </label>
+                  <label class="field">
+                    <span>窗口终点相位</span>
+                    <select name="window_end_phase">
+                      <option value="P">P</option>
+                      <option value="S">S</option>
+                      <option value="">Origin</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>窗口终点延后</span>
+                    <select name="after_arrival_sec" id="after-arrival-select"></select>
+                  </label>
+                  <label class="field">
+                    <span>输出格式</span>
+                    <select name="output_format">
+                      <option value="sacbl">sacbl</option>
+                    </select>
+                    <div class="field-note" id="output-format-note"></div>
+                  </label>
+                  <label class="field">
+                    <span>打包格式</span>
+                    <select name="bundle">
+                      <option value="tar">tar</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>轮询间隔秒</span>
+                    <input name="mail_poll_interval_sec" type="number" step="1" />
+                  </label>
+                  <label class="field">
+                    <span>等待上限分钟</span>
+                    <input name="mail_timeout_min" type="number" step="1" />
+                  </label>
+                  <label class="field sensitive-field">
+                    <span>QQ 授权码</span>
+                    <input name="qq_imap_auth_code" type="password" autocomplete="off" placeholder="只用于本次运行" />
+                    <div class="field-note" id="qq-imap-auth-code-note"></div>
+                  </label>
+                  <label class="field checkbox-field">
+                    <input name="submit_requests" type="checkbox" />
+                    <span>直接提交请求</span>
+                  </label>
+                  <div class="field span-full action-field">
+                    <div class="inline-actions">
+                      <button class="button button-primary" id="run-workflow" type="button">提交并开始流程</button>
+                      <button class="button button-secondary" id="resume-mail-workflow" type="button">补跑收信与下载</button>
+                    </div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="config-card" data-step="workspace">
+                <div class="card-head">
+                  <p class="eyebrow">Step 4</p>
+                  <h2>目录</h2>
+                </div>
+                <div class="field-grid">
+                  <label class="field span-full">
+                    <span>工作根目录</span>
+                    <input name="workspace_root" type="text" placeholder="服务启动后自动填入项目内 output/；也支持 /mnt/d/... 或 D:\\..." />
+                    <div class="field-note" id="workspace-root-note"></div>
+                  </label>
+                  <label class="field">
+                    <span>批次处理</span>
+                    <select name="batch_mode">
+                      <option value="new">自动新建批次</option>
+                      <option value="existing">继续已有批次</option>
+                    </select>
+                    <div class="field-note" id="batch-mode-note"></div>
+                  </label>
+                  <label class="field">
+                    <span>批次号</span>
+                    <select id="batch-id-select">
+                      <option value="">从已有批次下拉选择</option>
+                    </select>
+                    <input id="batch-id" name="batch_id" type="text" list="batch-catalog-options" placeholder="留空则自动生成新批次号" />
+                    <datalist id="batch-catalog-options"></datalist>
+                    <div class="field-note" id="batch-id-note"></div>
+                  </label>
+                  <div class="field span-full action-field">
+                    <div class="inline-actions">
+                      <button class="button button-secondary" id="batch-catalog-refresh" type="button">刷新已有批次</button>
+                      <div class="mini-status" id="batch-catalog-status">默认使用新批次模式</div>
+                    </div>
+                  </div>
+                  <div class="field span-full action-field">
+                    <div class="mini-status" id="batch-target-status">将自动新建批次子目录</div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="config-card" data-step="normalize">
+                <div class="card-head">
+                  <p class="eyebrow">Step 5</p>
+                  <h2>标准化</h2>
+                </div>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>预滤波</span>
+                    <input name="pre_filt" type="text" placeholder="0.002,0.005,2.0,4.0" />
+                  </label>
+                  <label class="field">
+                    <span>响应处理策略</span>
+                    <select name="response_backend">
+                      <option value="local_sac_first">local_sac_first</option>
+                      <option value="obspy_only">obspy_only</option>
+                    </select>
+                  </label>
+                </div>
+              </article>
+            </form>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
