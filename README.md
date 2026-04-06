@@ -1,5 +1,8 @@
 # Wilber Workflow
 
+[![CI](https://github.com/15236702150master/wilber-workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/15236702150master/wilber-workflow/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/15236702150master/wilber-workflow)](https://github.com/15236702150master/wilber-workflow/releases)
+[![Stars](https://img.shields.io/github/stars/15236702150master/wilber-workflow?style=social)](https://github.com/15236702150master/wilber-workflow/stargazers)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](#依赖与工具说明)
 [![Platform](https://img.shields.io/badge/Platform-WSL%20%2F%20Linux-1E5B84)](#运行边界)
 [![License](https://img.shields.io/badge/License-MIT-0F766E.svg)](LICENSE)
