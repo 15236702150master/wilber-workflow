@@ -105,6 +105,7 @@ http://127.0.0.1:8765
 - [安全说明](#安全说明)
 - [更新记录](#更新记录)
 - [贡献](#贡献)
+- [协作行为](#协作行为)
 - [许可证](#许可证)
 
 ## 一句话理解这个项目
@@ -297,6 +298,7 @@ wilberflow run-all --config /path/to/config.toml --workspace-root /path/to/outpu
 ```text
 wilber-workflow/
   CHANGELOG.md
+  CODE_OF_CONDUCT.md
   CONTRIBUTING.md
   LICENSE
   SECURITY.md
@@ -875,6 +877,12 @@ bash scripts/check-sensitive-files.sh
 1. 先按 README 在本地重新跑通环境
 2. 改完后做一次小批量冒烟验证
 3. 发布或提 PR 前运行 `bash scripts/check-sensitive-files.sh`
+
+## 协作行为
+
+如果你准备在这个仓库里参与 issue、PR 或公开讨论，也建议先看：
+
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ## 许可证
 

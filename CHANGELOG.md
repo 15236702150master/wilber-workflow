@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, adapted to the current stage of this re
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-06
+
 ### Added
 
 - GitHub issue templates for bug reports and feature requests
@@ -14,6 +16,7 @@ The format is based on Keep a Changelog, adapted to the current stage of this re
 - Repository badges for CI, release, and stars
 - `SECURITY.md`
 - `CHANGELOG.md`
+- `CODE_OF_CONDUCT.md`
 
 ### Changed
 
