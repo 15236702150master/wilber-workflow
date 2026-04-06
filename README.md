@@ -102,6 +102,8 @@ http://127.0.0.1:8765
 - [常见问题](#常见问题)
 - [与旧脚本的关系](#与旧脚本的关系)
 - [发布前检查](#发布前检查)
+- [安全说明](#安全说明)
+- [更新记录](#更新记录)
 - [贡献](#贡献)
 - [许可证](#许可证)
 
@@ -294,8 +296,10 @@ wilberflow run-all --config /path/to/config.toml --workspace-root /path/to/outpu
 
 ```text
 wilber-workflow/
+  CHANGELOG.md
   CONTRIBUTING.md
   LICENSE
+  SECURITY.md
   config.example.toml
   docs/
   examples/
@@ -837,6 +841,28 @@ bash scripts/check-sensitive-files.sh
 - 不要提交任何邮箱授权码、Token、`.env.local`
 - 再次检查 README 的启动命令、图片和示例配置是否都可用
 - 至少在一个新的本地环境里按 README 重新走通一次安装和启动
+
+## 安全说明
+
+如果你遇到的是普通报错、功能建议或使用疑问，直接提公开 issue 就可以。
+
+如果你发现的是更敏感的问题，例如：
+
+- 仓库中误提交了邮箱授权码、Token、Cookie
+- 导出的配置或日志泄露了不该公开的敏感字段
+- 下载链接、邮箱凭据处理或本地文件写入存在明显安全风险
+
+请不要直接把完整细节公开贴到 issue 里。
+
+先看：
+
+- [SECURITY.md](SECURITY.md)
+
+## 更新记录
+
+版本发布与发布后的重要改动整理在：
+
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## 贡献
 
