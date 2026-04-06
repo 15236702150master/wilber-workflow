@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: README 使用说明
+    url: https://github.com/15236702150master/wilber-workflow#readme
+    about: 如果你还不确定功能怎么用，建议先看 README 的快速开始、真实案例和常见问题

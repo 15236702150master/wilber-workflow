@@ -1,0 +1,40 @@
+name: Feature request
+description: 提出一个功能增强或体验优化建议
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        如果你想改进配置台、断点续跑、缓存、统计文件或 README，这里最适合提交需求。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 先讲清楚现在不方便的地方
+      placeholder: 例如：批量处理很多事件时，我想更清楚看到每个阶段的失败事件数量
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望怎么改
+      description: 说明你理想中的行为或界面
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过的替代方案
+      description: 如果有手工替代流程、旧脚本方案或其他工具，也可以写一下
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 使用场景
+      description: 说明这个需求最常出现在什么任务里
+      placeholder: 例如：远震体波项目、接收函数批量下载、metadata only 批量核查

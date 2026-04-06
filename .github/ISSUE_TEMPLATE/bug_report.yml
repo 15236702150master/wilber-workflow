@@ -1,0 +1,74 @@
+name: Bug report
+description: 报告一个会影响 WilberFlow 正常使用的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈问题。请尽量把复现步骤、运行环境和报错信息写完整，这样更容易定位。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题概述
+      description: 简要说明你遇到了什么问题
+      placeholder: 例如：点击“提交并开始流程”后状态栏一直停在邮件阶段
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序写出你做了什么
+      placeholder: |
+        1. 打开配置台
+        2. 选择数据集并搜索事件
+        3. 点击提交并开始流程
+        4. 观察到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+      description: 你原本希望发生什么
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果 / 报错
+      description: 可以直接粘贴错误提示、日志片段或状态栏文字
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: 运行环境
+      description: 服务端主要运行在哪个环境
+      options:
+        - WSL2 + Linux Python
+        - Native Linux
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 使用版本
+      description: 例如 v0.1.0 / main / commit hash
+      placeholder: v0.1.0
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 如果有截图、配置片段、批次号，也可以补在这里
