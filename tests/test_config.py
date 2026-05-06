@@ -34,6 +34,11 @@ channels = " BH? ,  ?HZ "
 [download]
 
 [normalize]
+
+[notify]
+feishu_webhook_url = "https://example.com/hook"
+notify_on_success = true
+notify_on_failure = false
 """
         with tempfile.TemporaryDirectory() as tmpdir_text:
             config_path = Path(tmpdir_text) / "config.toml"
@@ -41,6 +46,9 @@ channels = " BH? ,  ?HZ "
             config = load_config(config_path)
 
         self.assertEqual(config.request.channels, "BH?,?HZ")
+        self.assertEqual(config.notify.feishu_webhook_url, "https://example.com/hook")
+        self.assertTrue(config.notify.notify_on_success)
+        self.assertFalse(config.notify.notify_on_failure)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from .common import (
     write_json,
 )
 from .config import copy_config_into_workspace, load_config
+from .notify import build_feishu_workflow_message, send_feishu_text_message, should_send_feishu_notification
 from .pipeline import prepare_workspace, run_all, run_resume_from_mail, workflow_stage_sequence
 from .wilber import (
     attach_virtual_networks,
@@ -677,6 +678,8 @@ def ui_metadata() -> dict[str, object]:
             "channels": DEFAULT_CHANNELS,
             "workspace_root": str(_default_workspace_root()),
             "batch_id": _generate_batch_id(),
+            "notify_on_success": True,
+            "notify_on_failure": True,
         },
         "event_datasets": build_dataset_options(),
         "timewindow_before_options_min": TIMEWINDOW_BEFORE_OPTIONS,
@@ -719,6 +722,7 @@ def _run_workflow_in_background(
     global WORKFLOW_THREAD
 
     def worker() -> None:
+        logger = None
         try:
             if mode == "resume_from_mail" or not config_toml.strip():
                 config_path = workspace_root / ".wilberflow-studio" / "runtime_config.toml"
@@ -857,6 +861,7 @@ def _run_workflow_in_background(
                 workflow_state().get("stage_progress") if isinstance(workflow_state().get("stage_progress"), dict) else stage_progress,
                 stage_sequence[-1]["key"] if stage_sequence else "",
             )
+            finished_at = _utc_now().isoformat().replace("+00:00", "Z")
             update_workflow_state(
                 status="completed",
                 message="流程已完成" if mode == "run_all" else "补跑已完成",
@@ -866,12 +871,24 @@ def _run_workflow_in_background(
                 current_stage_key=stage_sequence[-1]["key"] if stage_sequence else "",
                 batch_id=batch_id,
                 workspace_base_root=str(workspace_base_root),
-                finished_at_utc=_utc_now().isoformat().replace("+00:00", "Z"),
+                finished_at_utc=finished_at,
                 log_path=str(workspace_root / "logs" / "pipeline.log"),
+            )
+            _notify_workflow_finished(
+                pipeline_config=pipeline_config,
+                status="completed",
+                mode=mode,
+                batch_id=batch_id,
+                workspace_root=workspace_root,
+                log_path=workspace_root / "logs" / "pipeline.log",
+                finished_at_utc=finished_at,
+                detail="流程已完成" if mode == "run_all" else "补跑已完成",
+                logger=logger,
             )
         except Exception as exc:  # noqa: BLE001
             current_state = workflow_state()
             current_stage_key = str(current_state.get("current_stage_key", "") or "")
+            finished_at = _utc_now().isoformat().replace("+00:00", "Z")
             update_workflow_state(
                 status="failed",
                 message=f"流程失败: {exc}",
@@ -884,12 +901,57 @@ def _run_workflow_in_background(
                 ),
                 batch_id=batch_id,
                 workspace_base_root=str(workspace_base_root),
-                finished_at_utc=_utc_now().isoformat().replace("+00:00", "Z"),
+                finished_at_utc=finished_at,
                 log_path=str(workspace_root / "logs" / "pipeline.log"),
             )
+            if "pipeline_config" in locals():
+                _notify_workflow_finished(
+                    pipeline_config=pipeline_config,
+                    status="failed",
+                    mode=mode,
+                    batch_id=batch_id,
+                    workspace_root=workspace_root,
+                    log_path=workspace_root / "logs" / "pipeline.log",
+                    finished_at_utc=finished_at,
+                    detail=f"流程失败: {exc}",
+                    logger=logger,
+                )
 
     WORKFLOW_THREAD = threading.Thread(target=worker, name="wilberflow-studio-runner", daemon=True)
     WORKFLOW_THREAD.start()
+
+
+def _notify_workflow_finished(
+    *,
+    pipeline_config,
+    status: str,
+    mode: str,
+    batch_id: str,
+    workspace_root: Path,
+    log_path: Path,
+    finished_at_utc: str | None,
+    detail: str,
+    logger,
+) -> None:
+    notify_config = pipeline_config.notify
+    if not should_send_feishu_notification(notify_config, status):
+        return
+    message = build_feishu_workflow_message(
+        status=status,
+        mode=mode,
+        batch_id=batch_id,
+        workspace_root=workspace_root,
+        log_path=log_path,
+        finished_at_utc=finished_at_utc,
+        detail=detail,
+    )
+    try:
+        send_feishu_text_message(notify_config, message)
+        if logger is not None:
+            logger.info("sent Feishu webhook notification for batch %s with status %s", batch_id, status)
+    except Exception as exc:  # noqa: BLE001
+        if logger is not None:
+            logger.warning("failed to send Feishu webhook notification for batch %s: %s", batch_id, exc)
 
 
 class WilberStudioHandler(SimpleHTTPRequestHandler):

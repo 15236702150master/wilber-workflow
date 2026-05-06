@@ -284,6 +284,19 @@
                     <span>等待上限分钟</span>
                     <input name="mail_timeout_min" type="number" step="1" />
                   </label>
+                  <label class="field span-full">
+                    <span>飞书 Webhook</span>
+                    <input name="feishu_webhook_url" type="url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+                    <div class="field-note" id="feishu-webhook-url-note"></div>
+                  </label>
+                  <label class="field checkbox-field">
+                    <input name="notify_on_success" type="checkbox" checked />
+                    <span>成功时发送飞书通知</span>
+                  </label>
+                  <label class="field checkbox-field">
+                    <input name="notify_on_failure" type="checkbox" checked />
+                    <span>失败时发送飞书通知</span>
+                  </label>
                   <label class="field sensitive-field">
                     <span>QQ 授权码</span>
                     <input name="qq_imap_auth_code" type="password" autocomplete="off" placeholder="只用于本次运行" />

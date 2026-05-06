@@ -56,6 +56,9 @@ const DEFAULT_SETTINGS = {
   bundle: "tar",
   mail_poll_interval_sec: "30",
   mail_timeout_min: "15",
+  feishu_webhook_url: "",
+  notify_on_success: true,
+  notify_on_failure: true,
   qq_imap_auth_code: "",
   submit_requests: false,
   workspace_root: "",
@@ -100,6 +103,9 @@ const FIELD_HELP = {
   bundle: "这里直接对应 Wilber 表单里的 Bundle As。当前官方页面支持 individual files 和 tar archive。",
   mail_poll_interval_sec: "邮箱轮询间隔，单位秒。常用 30。",
   mail_timeout_min: "等待全部 [Success] 邮件的最长时间，单位分钟。默认 15 分钟，更适合先做批量测试。",
+  feishu_webhook_url: "可选。填入飞书机器人 webhook 后，流程结束时会自动发中文通知；不填则不发送。",
+  notify_on_success: "勾选后，流程成功完成时发送飞书通知。",
+  notify_on_failure: "勾选后，流程失败时发送飞书通知，便于及时发现异常。",
   qq_imap_auth_code: "QQ 邮箱 IMAP 授权码。只用于当前运行，不会被页面长期保存。",
   submit_requests: "勾选后，点击“提交并开始流程”时会真的向 Wilber 提交请求，然后继续查邮件、下载和后处理。不勾选时，点击运行只会生成到 request plan，不会真正提交。",
   workspace_root: "官方只支持在 WSL/Linux 里运行本地服务。这里默认会自动填成当前项目目录下的 output/。如果你想把流程文件直接放到 Windows 盘，可在 WSL 里填 /mnt/d/...；从网页直接填 D:\\... 也会自动换算。",
@@ -164,6 +170,7 @@ const FIELD_NOTE_IDS = {
   batch_mode: "batch-mode-note",
   batch_id: "batch-id-note",
   request_email: "request-email-note",
+  feishu_webhook_url: "feishu-webhook-url-note",
   qq_imap_auth_code: "qq-imap-auth-code-note",
   output_format: "output-format-note",
 };
@@ -731,6 +738,17 @@ function settingsFromPreviewJson(payload) {
     settings.mail_timeout_min = String(mail.timeout_min);
   }
 
+  const notify = payload?.notify || {};
+  if (notify.feishu_webhook_url !== undefined && notify.feishu_webhook_url !== null) {
+    settings.feishu_webhook_url = String(notify.feishu_webhook_url);
+  }
+  if (notify.notify_on_success !== undefined) {
+    settings.notify_on_success = Boolean(notify.notify_on_success);
+  }
+  if (notify.notify_on_failure !== undefined) {
+    settings.notify_on_failure = Boolean(notify.notify_on_failure);
+  }
+
   if (normalize.pre_filt !== undefined) {
     settings.pre_filt = Array.isArray(normalize.pre_filt) ? normalize.pre_filt.join(",") : String(normalize.pre_filt || "");
   }
@@ -748,6 +766,7 @@ function settingsFromTomlConfig(payload) {
   const request = payload?.request || {};
   const mail = payload?.mail || {};
   const normalize = payload?.normalize || {};
+  const notify = payload?.notify || {};
 
   settings.event_dataset = "custom";
   if (query.starttime) {
@@ -844,6 +863,16 @@ function settingsFromTomlConfig(payload) {
   }
   if (mail.max_wait_minutes !== undefined) {
     settings.mail_timeout_min = String(mail.max_wait_minutes);
+  }
+
+  if (notify.feishu_webhook_url !== undefined) {
+    settings.feishu_webhook_url = String(notify.feishu_webhook_url);
+  }
+  if (notify.notify_on_success !== undefined) {
+    settings.notify_on_success = Boolean(notify.notify_on_success);
+  }
+  if (notify.notify_on_failure !== undefined) {
+    settings.notify_on_failure = Boolean(notify.notify_on_failure);
   }
 
   if (normalize.pre_filt !== undefined) {
@@ -1040,6 +1069,11 @@ function buildPreviewConfig(flat) {
       timeout_min: numberValue(flat.mail_timeout_min),
       auth_code: runtimeSecretProvided ? "[provided only in current session]" : "[set at runtime]",
     },
+    notify: {
+      feishu_webhook_url: flat.feishu_webhook_url ? "[已配置]" : null,
+      notify_on_success: Boolean(flat.notify_on_success),
+      notify_on_failure: Boolean(flat.notify_on_failure),
+    },
     download: {
       workspace_root: workspaceRoot || null,
     },
@@ -1187,6 +1221,12 @@ function buildTomlConfig(flat) {
     "message_lookback_hours = 24",
     "max_messages = 1500",
     "prefer_https = true",
+    "",
+    "[notify]",
+    `feishu_webhook_url = ${tomlString(flat.feishu_webhook_url || "")}`,
+    `notify_on_success = ${Boolean(flat.notify_on_success)}`,
+    `notify_on_failure = ${Boolean(flat.notify_on_failure)}`,
+    "timeout_seconds = 10",
     "",
     "[download]",
     "overwrite = false",

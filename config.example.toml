@@ -71,3 +71,9 @@ response_backend = "local_sac_first"
 overwrite = false
 selected_event_ids = []
 limit_events = 0
+
+[notify]
+feishu_webhook_url = ""
+notify_on_success = true
+notify_on_failure = true
+timeout_seconds = 10

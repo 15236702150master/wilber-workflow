@@ -86,12 +86,21 @@ class NormalizeConfig:
 
 
 @dataclass(frozen=True)
+class NotifyConfig:
+    feishu_webhook_url: str = ""
+    notify_on_success: bool = True
+    notify_on_failure: bool = True
+    timeout_seconds: int = 10
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     event_search: EventSearchConfig
     request: RequestConfig
     mail: MailConfig
     download: DownloadConfig
     normalize: NormalizeConfig
+    notify: NotifyConfig
 
 
 def _section(data: dict[str, object], key: str) -> dict[str, object]:
@@ -129,6 +138,7 @@ def load_config(path: Path) -> PipelineConfig:
     mail_data = _section(data, "mail")
     download_data = _section(data, "download")
     normalize_data = _section(data, "normalize")
+    notify_data = _section(data, "notify")
 
     query = event_search_data.get("query", {})
     if not isinstance(query, dict):
@@ -200,6 +210,12 @@ def load_config(path: Path) -> PipelineConfig:
             overwrite=bool(normalize_data.get("overwrite", False)),
             selected_event_ids=_string_items(normalize_data.get("selected_event_ids")),
             limit_events=_optional_positive_int(normalize_data.get("limit_events")),
+        ),
+        notify=NotifyConfig(
+            feishu_webhook_url=str(notify_data.get("feishu_webhook_url", "")).strip(),
+            notify_on_success=bool(notify_data.get("notify_on_success", True)),
+            notify_on_failure=bool(notify_data.get("notify_on_failure", True)),
+            timeout_seconds=int(notify_data.get("timeout_seconds", 10)),
         ),
     )
 
