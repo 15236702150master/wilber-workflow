@@ -2304,16 +2304,17 @@ async function runWorkflow() {
     resumeMailWorkflowButton.disabled = true;
   }
   try {
+    const resolvedBatchId = savedConfig.batch_id || submissionBatchId;
     const payload = await postJson("/api/workflow/run", {
       workspace_root: workspaceRoot,
       batch_mode: batchMode,
-      batch_id: batchMode === "existing" ? (savedConfig.batch_id || submissionBatchId) : submissionBatchId,
+      batch_id: resolvedBatchId,
       request_email: flat.request_email,
       qq_imap_auth_code: flat.qq_imap_auth_code,
       config_toml: configToml,
     });
     setWorkflowStatus([payload.message || "流程已启动", payload.batch_id ? `批次 ${payload.batch_id}` : ""].filter(Boolean).join(" · "));
-    if (batchMode === "existing" && payload.batch_id && form.elements.batch_id) {
+    if (payload.batch_id && form.elements.batch_id && batchMode === "existing") {
       form.elements.batch_id.value = payload.batch_id;
     }
     await loadBatchCatalog({ announceError: false });
