@@ -6,7 +6,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .common import DEFAULT_EVENT_SERVICE_URL, DEFAULT_WILBER_BASE_URL
+from .common import DEFAULT_EVENT_SERVICE_URL, DEFAULT_WILBER_BASE_URL, normalize_filter_text
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,8 @@ class MailConfig:
     subject_substring: str = "[Success]"
     from_substring: str = "wilber"
     poll_interval_seconds: int = 30
+    fast_poll_interval_seconds: int = 5
+    fast_poll_rounds: int = 12
     max_wait_minutes: int = 90
     message_lookback_hours: int = 24
     max_messages: int = 1500
@@ -144,7 +146,7 @@ def load_config(path: Path) -> PipelineConfig:
             sleep_seconds=float(event_search_data.get("sleep_seconds", 1.0)),
         ),
         request=RequestConfig(
-            channels=str(request_data.get("channels", "BHZ")),
+            channels=normalize_filter_text(str(request_data.get("channels", "BHZ"))),
             networks=str(request_data.get("networks", "")),
             stations=str(request_data.get("stations", "")),
             location_priority=str(request_data.get("location_priority", "00,--,10")),
@@ -178,6 +180,8 @@ def load_config(path: Path) -> PipelineConfig:
             subject_substring=str(mail_data.get("subject_substring", "[Success]")),
             from_substring=str(mail_data.get("from_substring", "wilber")),
             poll_interval_seconds=int(mail_data.get("poll_interval_seconds", 30)),
+            fast_poll_interval_seconds=int(mail_data.get("fast_poll_interval_seconds", 5)),
+            fast_poll_rounds=int(mail_data.get("fast_poll_rounds", 12)),
             max_wait_minutes=int(mail_data.get("max_wait_minutes", 90)),
             message_lookback_hours=int(mail_data.get("message_lookback_hours", 24)),
             max_messages=int(mail_data.get("max_messages", 1500)),

@@ -140,6 +140,41 @@ def consistency_check(label: str, expected_requests: dict[str, dict[str, str]]) 
     )
 
 
+def _search_message_ids(client, criteria: list[str], max_messages: int, logger=None) -> list[bytes]:
+    collected: list[bytes] = []
+    seen: set[bytes] = set()
+
+    def extend_ids(raw_ids: bytes | None) -> None:
+        if not raw_ids:
+            return
+        for message_id in reversed(raw_ids.split()[-max_messages:]):
+            if message_id in seen:
+                continue
+            seen.add(message_id)
+            collected.append(message_id)
+
+    searches: list[tuple[str, list[str]]] = []
+    if criteria:
+        searches.append(("targeted", criteria))
+    searches.append(("all", ["ALL"]))
+
+    for label, search_args in searches:
+        status, data = client.search(None, *search_args)
+        if logger is not None:
+            logger.info("IMAP %s search criteria=%s status=%s", label, " ".join(search_args), status)
+        if status != "OK" or not data:
+            continue
+        extend_ids(data[0] if data else None)
+
+    return collected[:max_messages]
+
+
+def poll_sleep_seconds(config: MailConfig, round_index: int) -> int:
+    if round_index < max(0, config.fast_poll_rounds):
+        return max(1, min(config.poll_interval_seconds, config.fast_poll_interval_seconds))
+    return max(1, config.poll_interval_seconds)
+
+
 def fetch_matches(config: MailConfig, expected_requests: dict[str, dict[str, str]], logger=None) -> list[MailMatch]:
     imap_user = require_env(config.imap_user_env)
     imap_password = require_env(config.imap_password_env)
@@ -159,6 +194,7 @@ def fetch_matches(config: MailConfig, expected_requests: dict[str, dict[str, str
         status, _ = client.select(config.mailbox, readonly=True)
         if status != "OK":
             raise RuntimeError(f"failed to open mailbox: {config.mailbox}")
+        client.noop()
 
         search_criteria: list[str] = []
         if config.from_substring.strip():
@@ -169,20 +205,9 @@ def fetch_matches(config: MailConfig, expected_requests: dict[str, dict[str, str
             imap_since_dt = requested_min_dt.astimezone(timezone.utc)
             search_criteria.extend(["SINCE", imap_since_dt.strftime("%d-%b-%Y")])
 
-        if search_criteria:
-            status, data = client.search(None, *search_criteria)
-            if logger is not None:
-                logger.info("IMAP server-side search criteria=%s status=%s", " ".join(search_criteria), status)
-            if status != "OK" or not data or not data[0]:
-                status, data = client.search(None, "ALL")
-                if logger is not None:
-                    logger.info("IMAP fallback search criteria=ALL status=%s", status)
-        else:
-            status, data = client.search(None, "ALL")
-
-        if status != "OK" or not data or not data[0]:
+        message_ids = _search_message_ids(client, search_criteria, config.max_messages, logger=logger)
+        if not message_ids:
             return []
-        message_ids = list(reversed(data[0].split()[-config.max_messages :]))
 
         if logger is not None:
             logger.info("IMAP search returned %s candidate messages", len(message_ids))
@@ -327,6 +352,7 @@ def poll_success_mail(
     deadline = time.time() + config.max_wait_minutes * 60
     matches: list[MailMatch] = []
     received_labels: set[str] = set()
+    round_index = 0
     if progress_callback is not None:
         progress_callback(len(expected_labels), 0, len(expected_labels), "正在等待 [Success] 邮件")
     while time.time() <= deadline:
@@ -336,7 +362,8 @@ def poll_success_mail(
             logger.warning("mail polling iteration failed: %s", exc)
             if progress_callback is not None:
                 progress_callback(len(expected_labels), len(received_labels), len(expected_labels - received_labels), f"邮件检查出错，准备重试: {exc}")
-            time.sleep(config.poll_interval_seconds)
+            time.sleep(poll_sleep_seconds(config, round_index))
+            round_index += 1
             continue
         received_labels = {match.request_label for match in matches}
         pending_labels = expected_labels - received_labels
@@ -361,7 +388,8 @@ def poll_success_mail(
             logger.info("all success mails received: %s", len(received_labels))
             return matches
         logger.info("mail polling pending=%s received=%s", len(pending_labels), len(received_labels))
-        time.sleep(config.poll_interval_seconds)
+        time.sleep(poll_sleep_seconds(config, round_index))
+        round_index += 1
 
     pending_labels = expected_labels - received_labels
     write_mail_outputs(stage_dir, matches, pending_labels)

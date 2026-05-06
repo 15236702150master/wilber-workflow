@@ -176,7 +176,11 @@ def format_ws_datetime(value: UTCDateTime) -> str:
 
 
 def parse_filter_tokens(text: str) -> list[str]:
-    return [item.strip() for item in text.split(",") if item.strip()]
+    return [item.strip() for item in re.split(r"[\n,;，；]+", text) if item.strip()]
+
+
+def normalize_filter_text(text: str) -> str:
+    return ",".join(parse_filter_tokens(text))
 
 
 def normalize_location_token(token: str) -> str:

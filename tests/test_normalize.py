@@ -84,6 +84,30 @@ class NormalizeTests(unittest.TestCase):
             self.assertEqual(len(jobs), 3)
             self.assertEqual(skipped, [])
 
+    def test_build_jobs_supports_custom_question_hz_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir_text:
+            tmpdir = Path(tmpdir_text)
+            event_dir = tmpdir / "1996_01_01_00_00_00_demo"
+            event_dir.mkdir()
+            pz_root = event_dir / "pz"
+            pz_root.mkdir()
+            event = EventInfo(
+                event_dir=event_dir,
+                event_id="1996_01_01_00_00_00",
+                event_time=UTCDateTime("1996-01-01T00:00:00"),
+                event_label=event_dir.name,
+            )
+
+            for channel in ("BHZ", "HHZ", "LHZ", "BHN"):
+                trace = _make_trace(channel=channel, starttime=event.event_time)
+                trace.write(str(event_dir / f"IU.ANMO.00.{channel}.SAC"), format="SAC")
+                (pz_root / f"SACPZ.IU.ANMO.00.{channel}").write_text("ZEROS 0\nPOLES 0\nCONSTANT 1\n", encoding="utf-8")
+
+            jobs, skipped = build_jobs([event], tmpdir / "out", overwrite=True, channel_patterns=["?HZ"])
+
+            self.assertEqual({job.channel for job in jobs}, {"BHZ", "HHZ", "LHZ"})
+            self.assertEqual({row["Channel"] for row in skipped}, {"BHN"})
+
     def test_find_matching_pz_searches_recursively_and_tolerates_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir_text:
             tmpdir = Path(tmpdir_text)

@@ -24,7 +24,7 @@ from .common import (
     setup_logger,
     write_json,
 )
-from .config import load_config
+from .config import copy_config_into_workspace, load_config
 from .pipeline import prepare_workspace, run_all, run_resume_from_mail, workflow_stage_sequence
 from .wilber import (
     attach_virtual_networks,
@@ -700,6 +700,13 @@ def _write_runtime_config(workspace_root: Path, config_toml: str) -> Path:
     return config_path
 
 
+def _persist_workspace_config(workspace_root: Path, config_toml: str, batch_id: str) -> tuple[Path, Path]:
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    runtime_config_path = _write_runtime_config(workspace_root, _with_batched_request_label_prefix(config_toml, batch_id))
+    copied_config_path = copy_config_into_workspace(runtime_config_path, workspace_root)
+    return runtime_config_path, copied_config_path
+
+
 def _run_workflow_in_background(
     workspace_base_root: Path,
     workspace_root: Path,
@@ -713,7 +720,7 @@ def _run_workflow_in_background(
 
     def worker() -> None:
         try:
-            if mode == "resume_from_mail":
+            if mode == "resume_from_mail" or not config_toml.strip():
                 config_path = workspace_root / ".wilberflow-studio" / "runtime_config.toml"
                 if not config_path.exists():
                     raise FileNotFoundError(f"missing runtime config for resume: {config_path}")
@@ -905,6 +912,10 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def _send_error_json(self, status: int, message: str) -> None:
         self._send_json({"error": message, "status": status}, status=status)
 
@@ -997,6 +1008,11 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                     batch_id_text,
                     create_new_if_missing=True,
                 )
+                runtime_config_path, copied_config_path = _persist_workspace_config(
+                    workspace_root,
+                    config_toml,
+                    resolved_batch_id,
+                )
                 update_workflow_state(
                     status="queued",
                     message="流程已提交，等待启动",
@@ -1019,7 +1035,7 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                     workspace_base_root,
                     workspace_root,
                     resolved_batch_id,
-                    config_toml,
+                    "",
                     request_email,
                     qq_imap_auth_code,
                 )
@@ -1030,6 +1046,8 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                         "batch_id": resolved_batch_id,
                         "workspace_base_root": str(workspace_base_root),
                         "workspace_root": str(workspace_root),
+                        "runtime_config_path": str(runtime_config_path),
+                        "copied_config_path": str(copied_config_path),
                         "log_path": str(workspace_root / "logs" / "pipeline.log"),
                     }
                 )
@@ -1037,6 +1055,43 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error_json(HTTPStatus.BAD_GATEWAY, f"workflow start failed: {exc}")
+            return
+        if parsed.path == "/api/workflow/save-config":
+            try:
+                payload = self._read_json_body()
+                workspace_root_text = str(payload.get("workspace_root", "")).strip() or str(_default_workspace_root())
+                batch_mode = str(payload.get("batch_mode", "new")).strip() or "new"
+                batch_id_text = str(payload.get("batch_id", "")).strip()
+                config_toml = str(payload.get("config_toml", ""))
+                if not config_toml.strip():
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "missing config_toml")
+                    return
+                workspace_base_root, workspace_root, resolved_batch_id = _resolve_batch_workspace(
+                    workspace_root_text,
+                    batch_mode,
+                    batch_id_text,
+                    create_new_if_missing=True,
+                )
+                runtime_config_path, copied_config_path = _persist_workspace_config(
+                    workspace_root,
+                    config_toml,
+                    resolved_batch_id,
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "message": "当前配置已保存到工作目录",
+                        "batch_id": resolved_batch_id,
+                        "workspace_base_root": str(workspace_base_root),
+                        "workspace_root": str(workspace_root),
+                        "runtime_config_path": str(runtime_config_path),
+                        "copied_config_path": str(copied_config_path),
+                    }
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                self._send_error_json(HTTPStatus.BAD_GATEWAY, f"save config failed: {exc}")
             return
         if parsed.path == "/api/workflow/resume-mail":
             try:

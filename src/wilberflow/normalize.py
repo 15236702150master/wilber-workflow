@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import fnmatch
 import math
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -347,10 +349,11 @@ def run_iris_fallback(
     raw_trace,
     pre_filt: tuple[float, float, float, float],
     output_unit: str,
-    routing_client: RoutingClient,
-    fdsn_clients: tuple[Client, ...],
+    routing_type: str,
     cache_dir: Path,
 ):
+    routing_client = RoutingClient(routing_type)
+    fdsn_clients = tuple(Client(name) for name in FALLBACK_FDSN_CLIENT_NAMES)
     ok, detail, inventory, cache_path = fetch_or_load_inventory(raw_trace, cache_dir, routing_client, fdsn_clients)
     if not ok or inventory is None:
         cache_text = f" ({cache_path.name})" if cache_path is not None else ""
@@ -416,19 +419,19 @@ def write_final_sac(trace, output_path: Path, event: EventInfo, geometry: dict[s
 
 
 def process_job(
+    job_index: int,
     job: TraceJob,
     pre_filt: tuple[float, float, float, float],
     output_unit: str,
     taup_model: TauPyModel,
-    routing_client: RoutingClient,
-    fdsn_clients: tuple[Client, ...],
+    routing_type: str,
     inventory_cache_dir: Path,
     response_backend: str,
 ):
     try:
         raw_trace = read_and_merge_raw_traces(job.sac_paths)
     except Exception as exc:
-        return False, {"Reason": f"failed to read raw SAC: {exc}", "Method": "none"}
+        return job_index, False, {"Reason": f"failed to read raw SAC: {exc}", "Method": "none"}
     geometry = build_geometry(raw_trace, job.event.event_time)
     base_info = {
         "EventID": job.event.event_id,
@@ -456,13 +459,12 @@ def process_job(
             raw_trace,
             pre_filt,
             output_unit,
-            routing_client,
-            fdsn_clients,
+            routing_type,
             inventory_cache_dir,
         )
         method = "iris_fallback"
         if not ok:
-            return False, {**base_info, "Method": method, "Reason": detail, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
+            return job_index, False, {**base_info, "Method": method, "Reason": detail, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
     else:
         if job.pz_path is not None:
             ok, detail, processed_trace = run_sac_transfer(raw_trace, job.pz_path, pre_filt, output_unit)
@@ -473,32 +475,37 @@ def process_job(
                     raw_trace,
                     pre_filt,
                     output_unit,
-                    routing_client,
-                    fdsn_clients,
+                    routing_type,
                     inventory_cache_dir,
                 )
                 method = "iris_fallback"
                 if not ok:
                     combined_reason = f"{reason}; {detail}" if reason else detail
-                    return False, {**base_info, "Method": method, "Reason": combined_reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
+                    return job_index, False, {**base_info, "Method": method, "Reason": combined_reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
         else:
             reason = "SACPZ not found; fallback to IRIS inventory"
             ok, detail, processed_trace, inventory_path = run_iris_fallback(
                 raw_trace,
                 pre_filt,
                 output_unit,
-                routing_client,
-                fdsn_clients,
+                routing_type,
                 inventory_cache_dir,
             )
             method = "iris_fallback"
             if not ok:
                 combined_reason = f"{reason}; {detail}" if reason else detail
-                return False, {**base_info, "Method": method, "Reason": combined_reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
+                return job_index, False, {**base_info, "Method": method, "Reason": combined_reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
 
     processed_trace.data = np.asarray(processed_trace.data, dtype=np.float32)
     write_final_sac(processed_trace, job.output_path, job.event, geometry, output_unit, taup_model)
-    return True, {**base_info, "Method": method, "Reason": reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
+    return job_index, True, {**base_info, "Method": method, "Reason": reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
+
+
+def response_worker_count(job_count: int) -> int:
+    if job_count <= 1:
+        return 1
+    cpu_total = os.cpu_count() or 4
+    return max(1, min(job_count, 8, cpu_total))
 
 
 def normalize_workspace(
@@ -526,36 +533,52 @@ def normalize_workspace(
     jobs, skipped_channels = build_jobs(events, output_root, pipeline_config.normalize.overwrite, channel_patterns)
 
     taup_model = TauPyModel(model="iasp91")
-    routing_client = RoutingClient(pipeline_config.normalize.routing_type)
-    fdsn_clients = tuple(Client(name) for name in FALLBACK_FDSN_CLIENT_NAMES)
+    response_workers = response_worker_count(len(jobs))
 
     success_rows: list[dict[str, object]] = []
     failure_rows: list[dict[str, object]] = []
     iris_fallback_success = 0
     if progress_callback is not None:
         progress_callback("response", 0, len(jobs), "等待去仪器响应", "running")
-    for index, job in enumerate(jobs, start=1):
-        if progress_callback is not None:
-            progress_callback("response", index - 1, len(jobs), f"正在处理 {index}/{len(jobs)}: {job.network}.{job.station}.{job.channel}", "running")
-        logger.info("[%s/%s] normalizing %s.%s.%s", index, len(jobs), job.network, job.station, job.channel)
-        ok, info = process_job(
-            job,
-            pre_filt,
-            pipeline_config.normalize.output_unit,
-            taup_model,
-            routing_client,
-            fdsn_clients,
-            inventory_cache_dir,
-            response_backend,
-        )
-        if ok:
-            success_rows.append(info)
-            if info["Method"] == "iris_fallback":
-                iris_fallback_success += 1
-        else:
-            failure_rows.append(info)
-        if progress_callback is not None:
-            progress_callback("response", index, len(jobs), f"已处理 {index}/{len(jobs)}: {job.network}.{job.station}.{job.channel}", "running")
+    if jobs:
+        logger.info("response normalization workers=%s jobs=%s backend=%s", response_workers, len(jobs), response_backend)
+    completed = 0
+    indexed_success_rows: list[tuple[int, dict[str, object]]] = []
+    indexed_failure_rows: list[tuple[int, dict[str, object]]] = []
+    with ThreadPoolExecutor(max_workers=response_workers, thread_name_prefix="wilberflow-response") as executor:
+        future_map = {}
+        for index, job in enumerate(jobs, start=1):
+            logger.info("[%s/%s] queued normalize %s.%s.%s", index, len(jobs), job.network, job.station, job.channel)
+            future = executor.submit(
+                process_job,
+                index,
+                job,
+                pre_filt,
+                pipeline_config.normalize.output_unit,
+                taup_model,
+                pipeline_config.normalize.routing_type,
+                inventory_cache_dir,
+                response_backend,
+            )
+            future_map[future] = job
+        for future in as_completed(future_map):
+            job = future_map[future]
+            completed += 1
+            if progress_callback is not None:
+                progress_callback("response", completed - 1, len(jobs), f"正在处理 {completed}/{len(jobs)}: {job.network}.{job.station}.{job.channel}", "running")
+            index, ok, info = future.result()
+            if ok:
+                indexed_success_rows.append((index, info))
+                if info["Method"] == "iris_fallback":
+                    iris_fallback_success += 1
+            else:
+                indexed_failure_rows.append((index, info))
+            logger.info("[%s/%s] normalized %s.%s.%s method=%s", completed, len(jobs), job.network, job.station, job.channel, info.get("Method", "unknown"))
+            if progress_callback is not None:
+                progress_callback("response", completed, len(jobs), f"已处理 {completed}/{len(jobs)}: {job.network}.{job.station}.{job.channel}", "running")
+
+    success_rows = [info for _, info in sorted(indexed_success_rows, key=lambda item: item[0])]
+    failure_rows = [info for _, info in sorted(indexed_failure_rows, key=lambda item: item[0])]
 
     write_csv(
         stage_dir / "processing_summary.csv",
@@ -613,6 +636,7 @@ def normalize_workspace(
             "selected_event_ids_count": len(selected_ids),
             "limit_events": "" if pipeline_config.normalize.limit_events is None else pipeline_config.normalize.limit_events,
             "response_backend": response_backend,
+            "response_workers": response_workers,
             "trace_job_count": len(jobs),
             "success_count": len(success_rows),
             "failure_count": len(failure_rows),

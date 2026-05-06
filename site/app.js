@@ -3,6 +3,7 @@ const LAST_PROFILE_KEY = "wilberflow-last-profile-v2";
 const DEFAULT_PROFILE = "Default";
 const SENSITIVE_FIELDS = new Set(["qq_imap_auth_code"]);
 const LEGACY_WORKSPACE_ROOTS = new Set(["/data/Wilber/workflow_demo"]);
+const AUTO_BATCH_ID_PATTERN = /^wf_\d{8}_\d{6}$/;
 const FALLBACK_STAGE_SEQUENCES = {
   run_all: [
     { key: "events", label: "搜索事件" },
@@ -82,7 +83,7 @@ const FIELD_HELP = {
   metadata_only: "勾选后，本轮只生成事件 CSV 和台站 CSV，不提交 Wilber 请求、不查邮件、不下载数据，也不做去响应和最终整理。适合先批量拿事件与台站对应关系做筛查。",
   network_patterns: "留空表示每个事件都不限制台网，也就是该事件可用台网全部参与，不只限于目录里的 500 个常见台网。下拉目录只是为了方便快速勾选常见台网。",
   station_patterns: "台站支持写 STA 或 NET.STA，也支持通配符，例如 ANMO、COLA、A*。留空表示不过滤。",
-  channel_patterns: "通道会按 Wilber 的原始分类提供，例如 BH?、BHZ、LH?、LHZ。",
+  channel_patterns: "这里可以直接手动输入任意 Wilber 支持的通道通配符；下拉分类只是快捷选择，不是白名单。常见例子有 BH?、BHZ、?HZ、HHZ、LH?，多个模式可用逗号分隔。",
   location_priority: "按优先级填写 location code，例如 00,--,10。越靠前越优先。",
   min_distance_deg: "台站到事件的最小震中距，单位度，例如 30 或 35。",
   max_distance_deg: "台站到事件的最大震中距，单位度，例如 95。",
@@ -136,6 +137,7 @@ const networkCatalogSummary = document.getElementById("network-catalog-summary")
 const networkSelectVisibleButton = document.getElementById("network-select-visible");
 const networkClearSelectionButton = document.getElementById("network-clear-selection");
 const networkCloseDropdownButton = document.getElementById("network-close-dropdown");
+const saveWorkspaceConfigButton = document.getElementById("save-workspace-config");
 const runWorkflowButton = document.getElementById("run-workflow");
 const resumeMailWorkflowButton = document.getElementById("resume-mail-workflow");
 const workflowStatus = document.getElementById("workflow-status");
@@ -206,6 +208,18 @@ function loadStore() {
   }
 }
 
+function looksLikeAutoBatchId(value) {
+  return AUTO_BATCH_ID_PATTERN.test(String(value || "").trim());
+}
+
+function sanitizeSettingsForProfile(settings) {
+  const sanitized = { ...clone(DEFAULT_SETTINGS), ...settings };
+  if (effectiveBatchMode(sanitized.batch_mode) === "new" && looksLikeAutoBatchId(sanitized.batch_id)) {
+    sanitized.batch_id = "";
+  }
+  return sanitized;
+}
+
 function saveStore(store) {
   const payload = JSON.stringify(store);
   const persisted = safeLocalStorageSet(STORAGE_KEY, payload);
@@ -237,6 +251,9 @@ function listProfiles(store) {
 
 function applySettings(settings) {
   const merged = { ...clone(DEFAULT_SETTINGS), ...settings };
+  if (merged.channel_patterns !== undefined) {
+    merged.channel_patterns = normalizeFilterText(merged.channel_patterns);
+  }
   form.querySelectorAll("[name]").forEach((element) => {
     const value = merged[element.name];
     if (element.type === "checkbox") {
@@ -256,6 +273,9 @@ function collectFlatSettings(options = {}) {
     }
     settings[element.name] = element.type === "checkbox" ? element.checked : element.value.trim();
   });
+  if (settings.channel_patterns !== undefined) {
+    settings.channel_patterns = normalizeFilterText(settings.channel_patterns);
+  }
   return settings;
 }
 
@@ -410,6 +430,10 @@ function uniqueList(values) {
 
 function csvList(value) {
   return uniqueList(splitLooseList(value));
+}
+
+function normalizeFilterText(value) {
+  return csvList(value).join(",");
 }
 
 function newlineList(value) {
@@ -1002,9 +1026,9 @@ function buildPreviewConfig(flat) {
       user: flat.request_user || null,
       email: flat.request_email || null,
       request_label_prefix: flat.request_label_prefix || null,
-      window_start_phase: flat.window_start_phase || "P",
+      window_start_phase: flat.window_start_phase ?? "",
       before_arrival_sec: numberValue(flat.before_arrival_sec),
-      window_end_phase: flat.window_end_phase || "P",
+      window_end_phase: flat.window_end_phase ?? "",
       after_arrival_sec: numberValue(flat.after_arrival_sec),
       output_format: flat.output_format || "sacbl",
       bundle: flat.bundle || "tar",
@@ -1098,6 +1122,8 @@ function buildTomlConfig(flat) {
   const normalizedLimit = tomlLimitValue(flat.limit_events, 20);
   const resolvedQuery = resolveDatasetQuery(flat);
   const metadataOnly = Boolean(flat.metadata_only);
+  const windowStartPhase = flat.window_start_phase ?? "";
+  const windowEndPhase = flat.window_end_phase ?? "";
 
   return [
     "[event_search]",
@@ -1132,9 +1158,9 @@ function buildTomlConfig(flat) {
     `min_azimuth_deg = ${numberValue(flat.min_azimuth_deg) ?? -180.0}`,
     `max_azimuth_deg = ${numberValue(flat.max_azimuth_deg) ?? 180.0}`,
     `window_start_before_min = ${secondsToMinutes(flat.before_arrival_sec, 2)}`,
-    `window_start_phase = ${tomlString(flat.window_start_phase || "P")}`,
+    `window_start_phase = ${tomlString(windowStartPhase)}`,
     `window_end_after_min = ${secondsToMinutes(flat.after_arrival_sec, 5)}`,
-    `window_end_phase = ${tomlString(flat.window_end_phase || "P")}`,
+    `window_end_phase = ${tomlString(windowEndPhase)}`,
     `output_format = ${tomlString(flat.output_format || "sacbl")}`,
     `bundle = ${tomlString(flat.bundle || "tar")}`,
     `user = ${tomlString(flat.request_user || "Your Name")}`,
@@ -1198,7 +1224,7 @@ function commitPatternPickerSelection(details) {
   const optionValues = new Set(boxes.map((box) => box.value));
   const customTokens = csvList(input.value).filter((token) => !optionValues.has(token));
   const selectedTokens = boxes.filter((box) => box.checked).map((box) => box.value);
-  input.value = uniqueList([...selectedTokens, ...customTokens]).join(",");
+  input.value = normalizeFilterText(uniqueList([...selectedTokens, ...customTokens]).join(","));
   syncPatternPicker(details);
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1282,6 +1308,14 @@ function attachPatternPickers() {
     }
 
     input.addEventListener("input", () => syncPatternPicker(details));
+    input.addEventListener("change", () => {
+      input.value = normalizeFilterText(input.value);
+      syncPatternPicker(details);
+    });
+    input.addEventListener("blur", () => {
+      input.value = normalizeFilterText(input.value);
+      syncPatternPicker(details);
+    });
     menu?.addEventListener("change", (event) => {
       const target = event.target;
       if (!(target instanceof HTMLInputElement) || target.type !== "checkbox") {
@@ -1716,7 +1750,7 @@ function loadProfile(name, options = {}) {
   const store = loadStore();
   const fallbackName = store.profiles[name] ? name : DEFAULT_PROFILE;
   activeProfileName = fallbackName;
-  applySettings(store.profiles[fallbackName] || DEFAULT_SETTINGS);
+  applySettings(sanitizeSettingsForProfile(store.profiles[fallbackName] || DEFAULT_SETTINGS));
   clearAllFieldReminders();
   applyWorkspaceRootDefault();
   form.elements.qq_imap_auth_code.value = "";
@@ -1731,7 +1765,7 @@ function loadProfile(name, options = {}) {
 function saveCurrentProfile(options = {}) {
   const { announce = true } = options;
   const store = loadStore();
-  store.profiles[activeProfileName] = collectFlatSettings();
+  store.profiles[activeProfileName] = sanitizeSettingsForProfile(collectFlatSettings());
   const persisted = saveStore(store);
   renderProfileSelect(store);
   refreshUi();
@@ -2135,19 +2169,67 @@ async function pollWorkflowStatus() {
   }
 }
 
+async function saveWorkspaceConfig() {
+  const flat = collectFlatSettings({ includeSensitive: true });
+  clearAllFieldReminders();
+  const workspaceRoot = effectiveWorkspaceRoot(flat.workspace_root);
+  const batchMode = effectiveBatchMode(flat.batch_mode);
+  const batchId = effectiveBatchId(flat.batch_id);
+  const submissionBatchId = batchMode === "new" && looksLikeAutoBatchId(batchId) ? "" : batchId;
+  if (!workspaceRoot) {
+    showValidationMessage("workspace_root", "请先填写工作根目录");
+    return null;
+  }
+  if (batchMode === "existing" && !submissionBatchId) {
+    showValidationMessage("batch_id", "继续已有批次时，请先从下拉里选择一个批次，或在右侧手动输入批次号");
+    return null;
+  }
+
+  const configToml = buildTomlConfig(flat);
+  setWorkflowStatus("正在保存当前配置到工作目录...");
+  if (saveWorkspaceConfigButton) {
+    saveWorkspaceConfigButton.disabled = true;
+  }
+  try {
+    const payload = await postJson("/api/workflow/save-config", {
+      workspace_root: workspaceRoot,
+      batch_mode: batchMode,
+      batch_id: submissionBatchId,
+      config_toml: configToml,
+    });
+    if (batchMode === "existing" && payload.batch_id && form.elements.batch_id) {
+      form.elements.batch_id.value = payload.batch_id;
+    } else if (batchMode === "new" && looksLikeAutoBatchId(batchId) && form.elements.batch_id) {
+      form.elements.batch_id.value = "";
+    }
+    refreshBatchStatus(collectFlatSettings());
+    await loadBatchCatalog({ announceError: false });
+    setWorkflowStatus([payload.message || "当前配置已保存", payload.batch_id ? `批次 ${payload.batch_id}` : ""].filter(Boolean).join(" · "));
+    return payload;
+  } catch (error) {
+    setWorkflowStatus(`保存配置失败: ${String(error.message || error)}`);
+    return null;
+  } finally {
+    if (saveWorkspaceConfigButton) {
+      saveWorkspaceConfigButton.disabled = false;
+    }
+  }
+}
+
 async function runWorkflow() {
   const flat = collectFlatSettings({ includeSensitive: true });
   clearAllFieldReminders();
   const workspaceRoot = effectiveWorkspaceRoot(flat.workspace_root);
   const batchMode = effectiveBatchMode(flat.batch_mode);
   const batchId = effectiveBatchId(flat.batch_id);
+  const submissionBatchId = batchMode === "new" && looksLikeAutoBatchId(batchId) ? "" : batchId;
   const willSubmitRequests = !flat.metadata_only && Boolean(flat.submit_requests);
   const sacOutputFormats = new Set(["sacbl", "sacbb", "saca"]);
   if (!workspaceRoot) {
     showValidationMessage("workspace_root", "请先填写工作根目录");
     return;
   }
-  if (batchMode === "existing" && !batchId) {
+  if (batchMode === "existing" && !submissionBatchId) {
     showValidationMessage("batch_id", "继续已有批次时，请先从下拉里选择一个批次，或在右侧手动输入批次号");
     return;
   }
@@ -2165,6 +2247,10 @@ async function runWorkflow() {
   }
 
   const configToml = buildTomlConfig(flat);
+  const savedConfig = await saveWorkspaceConfig();
+  if (!savedConfig) {
+    return;
+  }
   setWorkflowStatus("正在提交本地运行任务...");
   renderWorkflowStagebar({
     status: "queued",
@@ -2181,7 +2267,7 @@ async function runWorkflow() {
     const payload = await postJson("/api/workflow/run", {
       workspace_root: workspaceRoot,
       batch_mode: batchMode,
-      batch_id: batchId,
+      batch_id: batchMode === "existing" ? (savedConfig.batch_id || submissionBatchId) : submissionBatchId,
       request_email: flat.request_email,
       qq_imap_auth_code: flat.qq_imap_auth_code,
       config_toml: configToml,
@@ -2557,6 +2643,7 @@ function bindEventListeners() {
   importConfigFileInput?.addEventListener("change", handleImportConfigFile);
   document.getElementById("export-json").addEventListener("click", exportCurrentJson);
   document.getElementById("export-toml").addEventListener("click", exportCurrentToml);
+  saveWorkspaceConfigButton?.addEventListener("click", saveWorkspaceConfig);
   batchCatalogRefreshButton?.addEventListener("click", () => loadBatchCatalog({ announceError: true }));
   batchIdSelect?.addEventListener("change", () => {
     const selected = batchIdSelect.value || "";
@@ -2609,7 +2696,7 @@ async function bootstrap() {
 
   activeProfileName = store.profiles[lastProfile] ? lastProfile : DEFAULT_PROFILE;
   renderProfileSelect(store);
-  applySettings(store.profiles[activeProfileName] || DEFAULT_SETTINGS);
+  applySettings(sanitizeSettingsForProfile(store.profiles[activeProfileName] || DEFAULT_SETTINGS));
   clearAllFieldReminders();
   applyWorkspaceRootDefault();
   form.elements.qq_imap_auth_code.value = "";

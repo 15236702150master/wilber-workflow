@@ -190,9 +190,9 @@
                   <label class="field">
                     <span>通道通配符</span>
                     <div class="pattern-field">
-                      <input name="channel_patterns" type="text" placeholder="BHZ" />
-                      <details class="pattern-picker" data-target-input="channel_patterns" data-default-summary="从 Wilber 通道分类里选择">
-                        <summary><span class="pattern-summary">从 Wilber 通道分类里选择</span></summary>
+                      <input name="channel_patterns" type="text" placeholder="例如 BH?, ?HZ, HHZ；多个可写成 BH?,?HZ" />
+                      <details class="pattern-picker" data-target-input="channel_patterns" data-default-summary="从 Wilber 通道分类里快捷选择（也可手输）">
+                        <summary><span class="pattern-summary">从 Wilber 通道分类里快捷选择（也可手输）</span></summary>
                         <div class="pattern-menu"></div>
                       </details>
                     </div>
@@ -295,6 +295,7 @@
                   </label>
                   <div class="field span-full action-field">
                     <div class="inline-actions">
+                      <button class="button button-secondary" id="save-workspace-config" type="button">保存当前配置到工作目录</button>
                       <button class="button button-primary" id="run-workflow" type="button">提交并开始流程</button>
                       <button class="button button-secondary" id="resume-mail-workflow" type="button">补跑收信与下载</button>
                     </div>
