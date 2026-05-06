@@ -142,6 +142,7 @@ def _batch_manifest_for_path(path: Path) -> dict[str, object]:
     runtime_config = path / ".wilberflow-studio" / "runtime_config.toml"
     request_plan = path / "03_requests" / "request_plan.csv"
     mail_summary = path / "04_mail" / "summary.json"
+    log_path = path / "logs" / "pipeline.log"
     status = "unknown"
     if mail_summary.exists():
         try:
@@ -149,13 +150,20 @@ def _batch_manifest_for_path(path: Path) -> dict[str, object]:
             status = str(payload.get("status", "unknown"))
         except Exception:
             status = "unknown"
+    has_runtime_config = runtime_config.exists()
+    has_request_plan = request_plan.exists()
+    has_pipeline_log = log_path.exists()
+    is_config_only_placeholder = has_runtime_config and not has_request_plan and not has_pipeline_log
     modified_at_utc = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     return {
         "batch_id": path.name,
         "workspace_root": str(path),
-        "has_runtime_config": runtime_config.exists(),
-        "has_request_plan": request_plan.exists(),
+        "has_runtime_config": has_runtime_config,
+        "has_request_plan": has_request_plan,
+        "has_pipeline_log": has_pipeline_log,
         "status": status,
+        "display_status": "仅保存配置，未启动" if is_config_only_placeholder else status,
+        "is_config_only_placeholder": is_config_only_placeholder,
         "modified_at_utc": modified_at_utc,
     }
 

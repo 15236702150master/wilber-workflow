@@ -371,6 +371,7 @@ function batchTargetWorkspace(flat) {
 function refreshBatchStatus(flat = collectFlatSettings()) {
   const batchMode = effectiveBatchMode(flat.batch_mode);
   const batchId = effectiveBatchId(flat.batch_id);
+  const selectedBatchEntry = batchCatalogEntries.find((entry) => entry.batch_id === batchId) || null;
   const generatedExample = defaultBatchId();
   const target = batchTargetWorkspace(flat);
   const batchLabel = batchIdInput?.closest("label");
@@ -395,9 +396,13 @@ function refreshBatchStatus(flat = collectFlatSettings()) {
   }
   const batchIdNote = noteElement("batch_id");
   if (batchIdNote && !batchIdNote.classList.contains("has-reminder")) {
-    batchIdNote.textContent = batchMode === "existing"
-      ? "优先从上方下拉直接选已有批次；如果下拉里没有，也可以手动输入批次号。"
-      : "新批次模式下这里可以留空自动生成；如果你想自定义目录名，也可以手动填写。";
+    if (batchMode === "existing" && selectedBatchEntry?.is_config_only_placeholder) {
+      batchIdNote.textContent = "当前这个批次只有保存的配置，还没有真正启动流程；它适合继续编辑配置，不适合直接补跑收信与下载。";
+    } else {
+      batchIdNote.textContent = batchMode === "existing"
+        ? "优先从上方下拉直接选已有批次；如果下拉里没有，也可以手动输入批次号。"
+        : "新批次模式下这里可以留空自动生成；如果你想自定义目录名，也可以手动填写。";
+    }
   }
   if (batchTargetStatus) {
     batchTargetStatus.textContent = batchMode === "existing"
@@ -406,8 +411,9 @@ function refreshBatchStatus(flat = collectFlatSettings()) {
   }
   if (batchCatalogStatus) {
     if (batchMode === "existing") {
+      const configOnlyCount = batchCatalogEntries.filter((entry) => entry.is_config_only_placeholder).length;
       batchCatalogStatus.textContent = batchCatalogEntries.length
-        ? `已发现 ${batchCatalogEntries.length} 个已有批次，可直接输入或从浏览器建议中选择。`
+        ? `已发现 ${batchCatalogEntries.length} 个已有批次，可直接输入或从浏览器建议中选择。${configOnlyCount ? ` 其中 ${configOnlyCount} 个仅保存配置、未真正启动。` : ""}`
         : "当前根目录下还没有发现可继续的旧批次，可点“刷新已有批次”。";
     } else {
       batchCatalogStatus.textContent = "默认使用新批次模式。每次提交新任务都会进入新的批次子目录，避免和旧任务混在一起。";
@@ -2542,7 +2548,10 @@ async function loadBatchCatalog(options = {}) {
     batchCatalogEntries = Array.isArray(payload.batches) ? payload.batches : [];
     if (datalist) {
       datalist.innerHTML = batchCatalogEntries
-        .map((entry) => `<option value="${entry.batch_id}">${entry.batch_id}</option>`)
+        .map((entry) => {
+          const status = entry.display_status ? ` · ${entry.display_status}` : "";
+          return `<option value="${entry.batch_id}">${entry.batch_id}${status}</option>`;
+        })
         .join("");
     }
     if (batchIdSelect) {
@@ -2550,7 +2559,7 @@ async function loadBatchCatalog(options = {}) {
       batchIdSelect.innerHTML = [
         '<option value="">从已有批次下拉选择</option>',
         ...batchCatalogEntries.map((entry) => {
-          const status = entry.status ? ` · ${entry.status}` : "";
+          const status = entry.display_status ? ` · ${entry.display_status}` : "";
           return `<option value="${entry.batch_id}">${entry.batch_id}${status}</option>`;
         }),
       ].join("");
