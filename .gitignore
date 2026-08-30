@@ -26,3 +26,10 @@ output/
 logs/
 *.log
 *.pid
+
+# 个人运行配置（含姓名与邮箱），不入库；模板见 config.example.toml
+config.*.toml
+!config.example.toml
+
+# 运行产物
+output-*/
