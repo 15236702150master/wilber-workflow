@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import fnmatch
 import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,7 +19,7 @@ from obspy.io.sac import SACTrace
 from obspy.io.sac.util import SacError
 from obspy.taup import TauPyModel
 
-from .common import ensure_dir, parse_filter_tokens, parse_pre_filt, write_csv, write_stage_summary
+from .common import DEDUP_DROPPED_DIR_NAME, ensure_dir, parse_filter_tokens, parse_location_priority, parse_pre_filt, write_csv, write_stage_summary
 from .models import EventInfo, TraceJob
 
 
@@ -94,9 +95,30 @@ def find_matching_pz(event_dir: Path, sac_path: Path) -> Path | None:
     return candidates[0]
 
 
-def build_jobs(events: list[EventInfo], output_root: Path, overwrite: bool, channel_patterns: list[str]):
+def preferred_location_code(location_codes: list[str], location_priority: list[str]) -> str:
+    if not location_codes:
+        raise ValueError("location_codes must not be empty")
+
+    def sort_key(location_code: str) -> tuple[int, str]:
+        priority_token = "" if location_code == "--" else location_code
+        if priority_token in location_priority:
+            return (location_priority.index(priority_token), location_code)
+        return (len(location_priority) + 1, location_code)
+
+    return min(location_codes, key=sort_key)
+
+
+def build_jobs(
+    events: list[EventInfo],
+    output_root: Path,
+    overwrite: bool,
+    channel_patterns: list[str],
+    location_priority: list[str] | None = None,
+    keep_only_preferred_location: bool = True,
+):
     jobs: list[TraceJob] = []
     skipped_channels: list[dict[str, object]] = []
+    location_priority = location_priority or []
     for event in events:
         event_output_dir = output_root / event.event_id
         grouped_paths: dict[tuple[str, str, str, str], list[Path]] = {}
@@ -121,6 +143,28 @@ def build_jobs(events: list[EventInfo], output_root: Path, overwrite: bool, chan
                 channel,
             )
             grouped_paths.setdefault(key, []).append(sac_path)
+
+        if keep_only_preferred_location:
+            preferred_grouped_paths: dict[tuple[str, str, str, str], list[Path]] = {}
+            grouped_by_station_channel: dict[tuple[str, str, str], dict[str, list[Path]]] = {}
+            for (network, station, location_code, channel), sac_paths in grouped_paths.items():
+                grouped_by_station_channel.setdefault((network, station, channel), {})[location_code] = sac_paths
+            for (network, station, channel), location_map in grouped_by_station_channel.items():
+                preferred_location = preferred_location_code(list(location_map), location_priority)
+                preferred_grouped_paths[(network, station, preferred_location, channel)] = location_map[preferred_location]
+                for location_code, sac_paths in sorted(location_map.items()):
+                    if location_code == preferred_location:
+                        continue
+                    skipped_channels.append(
+                        {
+                            "EventID": event.event_id,
+                            "EventLabel": event.event_label,
+                            "InputPath": ";".join(str(path) for path in sac_paths),
+                            "Channel": channel,
+                            "Reason": f"location_not_preferred:{location_code}->{preferred_location}",
+                        }
+                    )
+            grouped_paths = preferred_grouped_paths
 
         base_counts: dict[tuple[str, str, str], int] = {}
         for network, station, _location, channel in grouped_paths:
@@ -212,36 +256,104 @@ def build_geometry(trace, event_time: UTCDateTime) -> dict[str, float | None]:
     }
 
 
-def run_sac_transfer(raw_trace, pz_path: Path, pre_filt: tuple[float, float, float, float], output_unit: str):
+def _sanitize_sacpz_for_sac(pz_path: Path, dest: Path) -> None:
+    """Copy a SACPZ file to ``dest`` with fields SAC's polezero parser can read.
+
+    SAC's ``trans from polezero`` parser chokes on values ObsPy writes that it
+    cannot interpret (e.g. an open-ended response written as ``END : None``); when
+    that happens SAC logs a datetime-parse error but still "uses" the polezero with
+    an un-normalized response, silently leaving the trace un-deconvolved. Rewrite
+    such fields to safe values so the deconvolution actually applies.
+    """
+    text = pz_path.read_text()
+    # Replace any "<field> : None" (open-ended start/end timestamps) with a far-future date.
+    text = re.sub(
+        r"(\*\s*(?:START|END)\s*:\s*)None",
+        r"\g<1>2599-12-31T23:59:59",
+        text,
+    )
+    dest.write_text(text)
+
+
+def run_sac_transfer(
+    raw_trace,
+    pz_path: Path,
+    pre_filt: tuple[float, float, float, float],
+    output_unit: str,
+    despike_mode: str = "off",
+    despike_window: int = 11,
+    despike_nsigma: float = 8.0,
+):
+    """Run the full SAC-native preprocessing chain in one macro.
+
+    Chain: rmean -> rtr -> taper -> trans (polezero deconvolution with pre_filt band)
+    -> rglitches (RUNAVG despike, optional) -> rmean -> rtr -> write.
+
+    SAC does all signal processing natively; the returned trace only needs the
+    Python-side zero-amplitude drop check (handled by the caller). ``despike_mode``
+    maps to SAC ``rglitches method runavg`` (mean+std window, closest native analog
+    to the hampel median+MAD despike); ``off`` skips it.
+    """
     if shutil.which("sac") is None:
         return False, "sac command not found", None
+    # SAC runs with cwd inside a temp dir, so the polezero path MUST be absolute
+    # or SAC silently fails to find it and leaves the trace un-deconvolved.
+    pz_abs = Path(pz_path).resolve()
+    if not pz_abs.exists():
+        return False, f"polezero file not found: {pz_abs}", None
+    unit = output_unit.lower()
     with tempfile.TemporaryDirectory(prefix="wilber_norm_") as temp_dir_text:
         temp_dir = Path(temp_dir_text)
         temp_sac = temp_dir / "work.sac"
+        # Sanitized PZ copy: SAC's parser cannot read ObsPy's "None" open-ended dates.
+        temp_pz = temp_dir / "polezero.dat"
+        _sanitize_sacpz_for_sac(pz_abs, temp_pz)
         raw_trace.write(str(temp_sac), format="SAC")
-        macro = (
-            f"r {temp_sac}\n"
-            "rtr\n"
-            "taper\n"
-            f"trans from polezero s {pz_path} to {output_unit.lower()} freq {pre_filt[0]} {pre_filt[1]} {pre_filt[2]} {pre_filt[3]}\n"
-            "wh\n"
-            "q\n"
-        )
+        lines = [
+            f"r {temp_sac}",
+            "rmean",
+            "rtr",
+            "taper",
+            f"trans from polezero subtype {temp_pz} to {unit} freq {pre_filt[0]} {pre_filt[1]} {pre_filt[2]} {pre_filt[3]}",
+        ]
+        if despike_mode == "hampel":
+            # rglitches RUNAVG: running mean+std window; THRESH2 = nsigma, MINAMP=0
+            # so the gate is purely the nsigma*sigma test (matching hampel's nsigma gate).
+            swinlen = despike_window * float(raw_trace.stats.delta)
+            lines.append(
+                f"rglitches method runavg swinlen {swinlen:.6f} thresh2 {despike_nsigma} minamp 0"
+            )
+        elif despike_mode != "off":
+            return False, f"unsupported despike_mode for sac backend: {despike_mode}", None
+        # Final demean + linear detrend to remove any residual offset/trend after deconvolution.
+        # "w over" overwrites the read file in place (header AND data). Do NOT use "wh", which
+        # only writes the header and would silently discard the deconvolved waveform.
+        lines += ["rmean", "rtr", "w over", "q"]
+        macro = "\n".join(lines) + "\n"
         proc = subprocess.run(["sac"], input=macro, text=True, capture_output=True, cwd=temp_dir, check=False)
         if proc.returncode != 0:
             return False, f"sac transfer failed: {proc.stderr.strip() or proc.stdout.strip()}", None
+        stdout = proc.stdout or ""
+        # Detect silent trans failures: SAC returns 0 even when polezero lookup fails.
+        if "ERROR" in stdout:
+            err_lines = [ln.strip() for ln in stdout.splitlines() if "ERROR" in ln]
+            return False, f"sac error: {'; '.join(err_lines[:3])}", None
         try:
             trace = read(str(temp_sac))[0]
         except Exception as exc:
             return False, f"failed to read SAC output: {exc}", None
-        return True, proc.stdout.strip(), trace
+        trace.data = np.asarray(trace.data, dtype=np.float32)
+        return True, stdout.strip(), trace
 
 
 def remove_response_with_inventory(raw_trace, inventory, pre_filt: tuple[float, float, float, float], output_unit: str):
+    # Mirror the SAC macro order: rmean -> rtr -> taper -> transfer.
+    # rmean: subtract the mean (demean); rtr: remove the linear trend; taper: Hann taper before deconvolution
+    # to suppress spectral leakage at the band edges defined by pre_filt.
     processed = raw_trace.copy()
-    processed.detrend("demean")
-    processed.detrend("linear")
-    processed.taper(max_percentage=0.05, type="hann")
+    processed.detrend("demean")  # rmean
+    processed.detrend("linear")  # rtr
+    processed.taper(max_percentage=0.05, type="hann")  # taper
     processed.remove_response(
         inventory=inventory,
         output=output_unit,
@@ -252,6 +364,106 @@ def remove_response_with_inventory(raw_trace, inventory, pre_filt: tuple[float, 
     )
     processed.data = np.asarray(processed.data, dtype=np.float32)
     return processed
+
+
+def hampel_despike(data: np.ndarray, window: int, nsigma: float) -> tuple[np.ndarray, int]:
+    if window < 3 or window % 2 == 0:
+        raise ValueError("despike_window must be an odd integer >= 3")
+    half = window // 2
+    data = np.asarray(data)
+    n = data.shape[0]
+    result = data.copy()
+
+    # Median and MAD for every full (window-wide) interior segment, vectorized via a
+    # sliding-window view. This is numerically identical to the per-sample computation
+    # for all interior indices i in [half, n - half - 1]; boundary indices (whose
+    # window shrinks to [0, n)) are handled separately below.
+    if n >= window:
+        windows = np.lib.stride_tricks.sliding_window_view(data, window)  # shape (n-window+1, window)
+        medians = np.median(windows, axis=1)
+        mads = np.median(np.abs(windows - medians[:, None]), axis=1)
+        sigmas = 1.4826 * mads
+        interior_centers = np.arange(half, n - half)  # length == n - window + 1
+        center_vals = data[interior_centers]
+        # sigma <= 0 branch: replace when the sample differs from the median.
+        zero_sigma = sigmas <= 0.0
+        differs = center_vals != medians
+        spike_mask_interior = zero_sigma & differs
+        # normal branch: |x - median| > nsigma * sigma (skip the zero-sigma cases).
+        with np.errstate(invalid="ignore", divide="ignore"):
+            normal_exceeds = np.abs(center_vals - medians) > nsigma * sigmas
+        spike_mask_interior |= (~zero_sigma) & normal_exceeds
+        result[interior_centers[spike_mask_interior]] = medians[spike_mask_interior]
+    else:
+        interior_centers = np.empty(0, dtype=np.intp)
+
+    # Boundary indices: window shrinks to [max(0,i-half), min(n,i+half+1)).
+    boundary = [i for i in range(n) if i < half or i >= n - half]
+    for idx in boundary:
+        left = max(0, idx - half)
+        right = min(n, idx + half + 1)
+        segment = data[left:right]
+        median = float(np.median(segment))
+        mad = float(np.median(np.abs(segment - median)))
+        sigma = 1.4826 * mad
+        if sigma <= 0.0:
+            if data[idx] != median:
+                result[idx] = median
+            continue
+        if abs(float(data[idx]) - median) > nsigma * sigma:
+            result[idx] = median
+
+    replaced = int(np.count_nonzero(result != data))
+    return result, replaced
+
+
+def _zero_amplitude_check(trace, zero_threshold: float):
+    """Zero-amplitude drop check only, for traces already preprocessed by SAC.
+
+    Returns (trace_or_None, info). Mirrors the drop semantics of clean_trace_data
+    but skips despike/demean (SAC's macro already did them).
+    """
+    processed = trace.copy()
+    data = np.asarray(processed.data, dtype=np.float64)
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak <= zero_threshold:
+        return None, {"status": "drop_zero_amplitude", "peak_before": peak, "peak_after": 0.0, "despike_replaced": 0}
+    processed.data = np.asarray(data, dtype=np.float32)
+    return processed, {"status": "cleaned", "peak_before": peak, "peak_after": peak, "despike_replaced": 0}
+
+
+def clean_trace_data(
+    trace,
+    zero_threshold: float,
+    despike_mode: str,
+    despike_window: int,
+    despike_nsigma: float,
+):
+    processed = trace.copy()
+    data = np.asarray(processed.data, dtype=np.float64)
+    peak_before = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak_before <= zero_threshold:
+        return None, {"status": "drop_zero_amplitude", "peak_before": peak_before, "peak_after": 0.0, "despike_replaced": 0}
+
+    replaced = 0
+    if despike_mode == "hampel":
+        data, replaced = hampel_despike(data, despike_window, despike_nsigma)
+    elif despike_mode != "off":
+        raise ValueError(f"unsupported despike_mode: {despike_mode}")
+
+    data = data - np.mean(data)
+    if len(data) >= 2:
+        x = np.arange(len(data), dtype=np.float64)
+        coeffs = np.polyfit(x, data, 1)
+        data = data - np.polyval(coeffs, x)
+    # Hann taper removed: the response-removal stage already applies taper via pre_filt.
+
+    peak_after = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak_after <= zero_threshold:
+        return None, {"status": "drop_zero_after_clean", "peak_before": peak_before, "peak_after": peak_after, "despike_replaced": replaced}
+
+    processed.data = np.asarray(data, dtype=np.float32)
+    return processed, {"status": "cleaned", "peak_before": peak_before, "peak_after": peak_after, "despike_replaced": replaced}
 
 
 def inventory_channel_count(inventory) -> int:
@@ -414,6 +626,13 @@ def write_final_sac(trace, output_path: Path, event: EventInfo, geometry: dict[s
         if t3 is not None:
             sac.t3 = t3
             sac.kt3 = "sP"
+    # Phase arrival times are now in t0/t2/t3; clear the corresponding user markers
+    # so downstream tools do not mix the two header families.
+    sac.user0 = -12345.0
+    sac.user2 = -12345.0
+    sac.user3 = -12345.0
+    sac.kuser0 = ""
+    sac.kuser2 = ""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sac.write(str(output_path))
 
@@ -427,6 +646,10 @@ def process_job(
     routing_type: str,
     inventory_cache_dir: Path,
     response_backend: str,
+    zero_threshold: float,
+    despike_mode: str,
+    despike_window: int,
+    despike_nsigma: float,
 ):
     try:
         raw_trace = read_and_merge_raw_traces(job.sac_paths)
@@ -448,6 +671,10 @@ def process_job(
         "Npts": raw_trace.stats.npts,
         "DistanceDeg": "" if geometry["distance_deg"] is None else f"{geometry['distance_deg']:.6f}",
         "InventoryFile": "",
+        "PreprocessStatus": "",
+        "DespikeReplaced": 0,
+        "PeakBeforeClean": "",
+        "PeakAfterClean": "",
     }
     method = "none"
     reason = ""
@@ -467,7 +694,15 @@ def process_job(
             return job_index, False, {**base_info, "Method": method, "Reason": detail, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
     else:
         if job.pz_path is not None:
-            ok, detail, processed_trace = run_sac_transfer(raw_trace, job.pz_path, pre_filt, output_unit)
+            ok, detail, processed_trace = run_sac_transfer(
+                raw_trace,
+                job.pz_path,
+                pre_filt,
+                output_unit,
+                despike_mode=despike_mode,
+                despike_window=despike_window,
+                despike_nsigma=despike_nsigma,
+            )
             method = "local_sac"
             if not ok:
                 reason = detail
@@ -496,9 +731,40 @@ def process_job(
                 combined_reason = f"{reason}; {detail}" if reason else detail
                 return job_index, False, {**base_info, "Method": method, "Reason": combined_reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
 
-    processed_trace.data = np.asarray(processed_trace.data, dtype=np.float32)
+    if method == "local_sac":
+        # SAC-native macro already performed rmean/rtr/taper/trans/(rglitches)/rmean/rtr,
+        # so only the zero-amplitude drop check remains (no despike/demean to redo).
+        processed_trace, clean_info = _zero_amplitude_check(processed_trace, zero_threshold)
+    else:
+        processed_trace, clean_info = clean_trace_data(
+            processed_trace,
+            zero_threshold=zero_threshold,
+            despike_mode=despike_mode,
+            despike_window=despike_window,
+            despike_nsigma=despike_nsigma,
+        )
+    if processed_trace is None:
+        return job_index, False, {
+            **base_info,
+            "Method": method,
+            "Reason": reason or clean_info["status"],
+            "InventoryFile": "" if inventory_path is None else str(inventory_path),
+            "PreprocessStatus": clean_info["status"],
+            "DespikeReplaced": clean_info["despike_replaced"],
+            "PeakBeforeClean": f"{clean_info['peak_before']:.6e}",
+            "PeakAfterClean": f"{clean_info['peak_after']:.6e}",
+        }
     write_final_sac(processed_trace, job.output_path, job.event, geometry, output_unit, taup_model)
-    return job_index, True, {**base_info, "Method": method, "Reason": reason, "InventoryFile": "" if inventory_path is None else str(inventory_path)}
+    return job_index, True, {
+        **base_info,
+        "Method": method,
+        "Reason": reason,
+        "InventoryFile": "" if inventory_path is None else str(inventory_path),
+        "PreprocessStatus": clean_info["status"],
+        "DespikeReplaced": clean_info["despike_replaced"],
+        "PeakBeforeClean": f"{clean_info['peak_before']:.6e}",
+        "PeakAfterClean": f"{clean_info['peak_after']:.6e}",
+    }
 
 
 def response_worker_count(job_count: int) -> int:
@@ -523,6 +789,9 @@ def normalize_workspace(
     response_backend = (pipeline_config.normalize.response_backend or "local_sac_first").strip().lower()
     if response_backend not in {"local_sac_first", "obspy_only"}:
         raise ValueError(f"unsupported normalize.response_backend: {pipeline_config.normalize.response_backend}")
+    despike_mode = (pipeline_config.normalize.despike_mode or "hampel").strip().lower()
+    if despike_mode not in {"off", "hampel"}:
+        raise ValueError(f"unsupported normalize.despike_mode: {pipeline_config.normalize.despike_mode}")
     selected_ids = {item.strip() for item in pipeline_config.normalize.selected_event_ids if item.strip()}
     events = discover_events(
         workspace_root / "06_extract" / "raw",
@@ -530,7 +799,15 @@ def normalize_workspace(
         limit_events=pipeline_config.normalize.limit_events,
     )
     channel_patterns = parse_filter_tokens(pipeline_config.request.channels)
-    jobs, skipped_channels = build_jobs(events, output_root, pipeline_config.normalize.overwrite, channel_patterns)
+    location_priority = parse_location_priority(pipeline_config.request.location_priority)
+    jobs, skipped_channels = build_jobs(
+        events,
+        output_root,
+        pipeline_config.normalize.overwrite,
+        channel_patterns,
+        location_priority=location_priority,
+        keep_only_preferred_location=pipeline_config.normalize.keep_only_preferred_location,
+    )
 
     taup_model = TauPyModel(model="iasp91")
     response_workers = response_worker_count(len(jobs))
@@ -559,6 +836,10 @@ def normalize_workspace(
                 pipeline_config.normalize.routing_type,
                 inventory_cache_dir,
                 response_backend,
+                pipeline_config.normalize.zero_threshold,
+                despike_mode,
+                pipeline_config.normalize.despike_window,
+                pipeline_config.normalize.despike_nsigma,
             )
             future_map[future] = job
         for future in as_completed(future_map):
@@ -597,6 +878,10 @@ def normalize_workspace(
             "Npts",
             "DistanceDeg",
             "InventoryFile",
+            "PreprocessStatus",
+            "DespikeReplaced",
+            "PeakBeforeClean",
+            "PeakAfterClean",
             "Method",
             "Reason",
         ],
@@ -619,6 +904,10 @@ def normalize_workspace(
             "Npts",
             "DistanceDeg",
             "InventoryFile",
+            "PreprocessStatus",
+            "DespikeReplaced",
+            "PeakBeforeClean",
+            "PeakAfterClean",
             "Method",
             "Reason",
         ],
@@ -636,6 +925,8 @@ def normalize_workspace(
             "selected_event_ids_count": len(selected_ids),
             "limit_events": "" if pipeline_config.normalize.limit_events is None else pipeline_config.normalize.limit_events,
             "response_backend": response_backend,
+            "despike_mode": despike_mode,
+            "keep_only_preferred_location": pipeline_config.normalize.keep_only_preferred_location,
             "response_workers": response_workers,
             "trace_job_count": len(jobs),
             "success_count": len(success_rows),
@@ -647,3 +938,123 @@ def normalize_workspace(
     )
     if progress_callback is not None:
         progress_callback("response", len(jobs), len(jobs), f"去仪器响应完成：{len(jobs)}/{len(jobs)}", "completed")
+
+
+# --- Phase arrival markers (t0/t2/t3) and user-marker cleanup --------------------
+
+# SAC "undefined" sentinel for floats; matches ObsPy's SACTrace default.
+_SAC_UNDEFINED = -12345.0
+# SAC sub-fields whose user-marker values we zero out once t0/t2/t3 carry the phase times.
+_PHASE_USER_FIELDS: tuple[str, ...] = ("user0", "user2", "user3")
+_PHASE_USER_KFIELDS: tuple[str, ...] = ("kuser0", "kuser2")  # SACTrace only exposes kuser0/kuser1/kuser2
+
+
+def _write_phase_arrivals_for_sac(
+    sac_path: Path,
+    taup_model: TauPyModel,
+) -> tuple[bool, str]:
+    """Write P / pP / sP phase arrival times to t0 / t2 / t3 for one SAC file.
+
+    Returns (ok, reason). Skips (returns ok=True, reason="skipped:<X>") when the
+    SAC file lacks the geometry needed to compute arrivals (evdp / gcarc).
+    """
+    try:
+        sac = SACTrace.read(str(sac_path))
+    except Exception as exc:
+        return False, f"read_failed:{exc}"
+    evdp = getattr(sac, "evdp", _SAC_UNDEFINED)
+    gcarc = getattr(sac, "gcarc", _SAC_UNDEFINED)
+    if evdp == _SAC_UNDEFINED or gcarc == _SAC_UNDEFINED:
+        return True, "skipped:missing_geometry"
+    if evdp is None or gcarc is None:
+        return True, "skipped:missing_geometry"
+    t0 = get_phase_time(taup_model, float(evdp), float(gcarc), ["P", "Pdiff", "PKP", "PKIKP"])
+    if t0 is not None:
+        sac.t0 = t0
+        sac.kt0 = "P"
+    t2 = get_phase_time(taup_model, float(evdp), float(gcarc), ["pP"])
+    if t2 is not None:
+        sac.t2 = t2
+        sac.kt2 = "pP"
+    t3 = get_phase_time(taup_model, float(evdp), float(gcarc), ["sP"])
+    if t3 is not None:
+        sac.t3 = t3
+        sac.kt3 = "sP"
+    sac.write(str(sac_path))
+    return True, "ok"
+
+
+def _clear_user_phase_markers_for_sac(sac_path: Path) -> tuple[bool, str]:
+    """Reset user0/user2/user3 (and their k labels) to undefined/empty for one SAC file."""
+    try:
+        sac = SACTrace.read(str(sac_path))
+    except Exception as exc:
+        return False, f"read_failed:{exc}"
+    for field in _PHASE_USER_FIELDS:
+        setattr(sac, field, _SAC_UNDEFINED)
+    for kfield in _PHASE_USER_KFIELDS:
+        setattr(sac, kfield, "")
+    sac.write(str(sac_path))
+    return True, "ok"
+
+
+def _iter_event_dirs(events_root: Path) -> list[Path]:
+    # Exclude the cross-band dedup overflow folder so batch helpers don't reprocess dropped files.
+    return sorted(path for path in events_root.iterdir() if path.is_dir() and path.name != DEDUP_DROPPED_DIR_NAME)
+
+
+def _iter_sac_files(event_dir: Path) -> list[Path]:
+    # Match both raw (*.SAC) and normalized outputs (*.sac) case-insensitively.
+    return sorted(path for path in event_dir.iterdir() if path.is_file() and path.suffix.lower() == ".sac")
+
+
+def write_phase_arrivals_workspace(
+    workspace_root: Path,
+    taup_model: TauPyModel | None = None,
+) -> dict[str, int]:
+    """Batch-write P/pP/sP arrivals (t0/t2/t3) for every event under 07_final/events.
+
+    Walks each event directory and rewrites every SAC file in place. Designed so a
+    single call processes all events at once.
+    """
+    events_root = workspace_root / "07_final" / "events"
+    if not events_root.exists():
+        return {"events": 0, "files": 0, "skipped": 0, "failed": 0}
+    model = taup_model if taup_model is not None else TauPyModel(model="iasp91")
+    file_count = 0
+    skipped_count = 0
+    failed_count = 0
+    for event_dir in _iter_event_dirs(events_root):
+        for sac_path in _iter_sac_files(event_dir):
+            ok, _reason = _write_phase_arrivals_for_sac(sac_path, model)
+            if ok:
+                file_count += 1
+            else:
+                failed_count += 1
+    return {
+        "events": len(_iter_event_dirs(events_root)),
+        "files": file_count,
+        "skipped": skipped_count,
+        "failed": failed_count,
+    }
+
+
+def clear_user_phase_markers_workspace(workspace_root: Path) -> dict[str, int]:
+    """Batch-clear user0/user2/user3 (and kuser0/2/3) for every event under 07_final/events."""
+    events_root = workspace_root / "07_final" / "events"
+    if not events_root.exists():
+        return {"events": 0, "files": 0, "failed": 0}
+    file_count = 0
+    failed_count = 0
+    for event_dir in _iter_event_dirs(events_root):
+        for sac_path in _iter_sac_files(event_dir):
+            ok, _reason = _clear_user_phase_markers_for_sac(sac_path)
+            if ok:
+                file_count += 1
+            else:
+                failed_count += 1
+    return {
+        "events": len(_iter_event_dirs(events_root)),
+        "files": file_count,
+        "failed": failed_count,
+    }
