@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 import fnmatch
 import hashlib
+from http.client import IncompleteRead
 import json
+import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -59,6 +62,7 @@ STATION_SELECTION_FIELDNAMES = [
     "Station",
     "StationID",
     "SelectedLocationCode",
+    "ChannelSelectionMode",
     "SelectedChannels",
     "SelectedChannelCount",
     "MatchingLocationCodes",
@@ -84,6 +88,7 @@ REQUEST_PLAN_FIELDNAMES = [
     "Networks",
     "Stations",
     "Channels",
+    "ChannelSelectionMode",
     "DistanceMinDeg",
     "DistanceMaxDeg",
     "AzimuthMinDeg",
@@ -110,6 +115,22 @@ StageProgressCallback = Callable[[str, int | None, int | None, str | None, str |
 STATION_STAGE_MAX_WORKERS = 4
 REQUEST_STAGE_MAX_WORKERS = 3
 STATION_RAW_CACHE_TTL_SECONDS = 6 * 60 * 60
+CHANNEL_PREFERENCE_ORDER = ("BHZ", "HHZ", "SHZ", "EHZ", "DHZ", "MHZ", "LHZ", "VHZ", "UHZ")
+CHANNEL_PREFERENCE_RANK = {channel: index for index, channel in enumerate(CHANNEL_PREFERENCE_ORDER)}
+BROWSER_BRIDGE_TARGET_TIMEOUT_SECONDS = 120
+BROWSER_BRIDGE_RESTART_TIMEOUT_SECONDS = 60
+BROWSER_BRIDGE_RETRY_ATTEMPTS = 2
+# 仓库根目录由本文件位置推导（src/wilberflow/wilber.py -> 上溯两级），
+# 不写死绝对路径，便于他人克隆到任意目录后直接使用。
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+BROWSER_BRIDGE_START_SCRIPT = str(_REPO_ROOT / "scripts" / "start-bridge.sh")
+
+# Chrome CDP 桥接脚本不随本仓库分发（属于外部工具），默认在用户目录下查找，
+# 可用环境变量 WILBERFLOW_BROWSER_BRIDGE_SCRIPT 覆盖。
+BROWSER_BRIDGE_SCRIPT = os.environ.get(
+    "WILBERFLOW_BROWSER_BRIDGE_SCRIPT",
+    str(Path.home() / ".codex" / "skills" / "chrome-cdp" / "scripts" / "browser-bridge.mjs"),
+)
 
 
 def _stable_payload_hash(payload: object) -> str:
@@ -181,7 +202,7 @@ def _http_get_text_with_retry_count(
                 retry_sleep_seconds=0.0,
             )
             return text, retries
-        except (URLError, TimeoutError, OSError) as exc:
+        except (URLError, TimeoutError, OSError, IncompleteRead) as exc:
             last_error = exc
             retries += 1
             if attempt >= max(1, retry_attempts):
@@ -536,12 +557,294 @@ def matching_channel_details(station: StationRecord, channel_patterns: list[str]
     return tuple(location_codes), tuple(deduped_channels), count
 
 
+def _channel_priority_rank(channel: str) -> tuple[int, str]:
+    return (CHANNEL_PREFERENCE_RANK.get(channel, len(CHANNEL_PREFERENCE_RANK)), channel)
+
+
+def _best_channels_for_location(channels: tuple[str, ...]) -> tuple[str, ...]:
+    if not channels:
+        return ()
+    best_rank = min(_channel_priority_rank(channel)[0] for channel in channels)
+    return tuple(channel for channel in channels if _channel_priority_rank(channel)[0] == best_rank)
+
+
+def normalize_channel_selection_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized == "all_matching":
+        return "all_matching"
+    return "preferred"
+
+
+def normalize_station_selection_backend(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"wilber_page", "wilber-page", "browser"}:
+        return "wilber_page"
+    return "python"
+
+
+def _browser_bridge_json(*args: str) -> object:
+    command = [
+        "node",
+        BROWSER_BRIDGE_SCRIPT,
+        "--json",
+        *args,
+    ]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        error_text = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(error_text or f"browser bridge command failed: {' '.join(command)}")
+    text = (proc.stdout or "").strip()
+    if not text:
+        raise RuntimeError(f"browser bridge returned empty output for: {' '.join(command)}")
+    return json.loads(text)
+
+
+def _bridge_error_text(exc: Exception) -> str:
+    return str(exc).strip().lower()
+
+
+def _bridge_restart_needed(exc: Exception) -> bool:
+    text = _bridge_error_text(exc)
+    return (
+        "command failed: list" in text
+        or "no devtoolsactiveport found" in text
+        or "bridge is not ready" in text
+        or "bridge-required" in text
+        or "cannot connect to chrome" in text
+    )
+
+
+def _start_browser_bridge() -> None:
+    proc = subprocess.run(
+        ["bash", BROWSER_BRIDGE_START_SCRIPT],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        error_text = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(error_text or "failed to start browser bridge")
+
+
+def _ensure_browser_bridge_ready() -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, BROWSER_BRIDGE_RETRY_ATTEMPTS + 1):
+        try:
+            status = _browser_bridge_json("browser_status")
+            if isinstance(status, dict):
+                if bool(status.get("ready")):
+                    return
+                # Older mocked payloads and some wrapper paths may only expose tab data.
+                if "tabs" in status and "ready" not in status and "error" not in status:
+                    return
+            raise RuntimeError(json.dumps(status, ensure_ascii=False) if isinstance(status, dict) else "browser bridge not ready")
+        except Exception as exc:
+            last_error = exc
+            if attempt >= BROWSER_BRIDGE_RETRY_ATTEMPTS or not _bridge_restart_needed(exc):
+                break
+            _start_browser_bridge()
+            deadline = time.time() + BROWSER_BRIDGE_RESTART_TIMEOUT_SECONDS
+            while time.time() <= deadline:
+                try:
+                    status = _browser_bridge_json("browser_status")
+                    if isinstance(status, dict) and bool(status.get("ready")):
+                        return
+                except Exception:
+                    pass
+                time.sleep(1.0)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("browser bridge not ready")
+
+
+def _browser_bridge_tabs() -> list[dict[str, object]]:
+    payload = _browser_bridge_json("browser_get_tabs")
+    if isinstance(payload, dict):
+        tabs = payload.get("tabs")
+    else:
+        tabs = payload
+    if not isinstance(tabs, list):
+        raise RuntimeError("browser bridge tabs payload missing")
+    return [item for item in tabs if isinstance(item, dict)]
+
+
+def _browser_bridge_execute_js(target: str, script: str) -> str:
+    payload = _browser_bridge_json("browser_execute_js", target, script)
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if result is None:
+            raise RuntimeError("browser bridge JS result missing")
+        return str(result)
+    if isinstance(payload, str):
+        return payload
+    raise RuntimeError("unexpected browser bridge JS payload")
+
+
+def _browser_bridge_wait_for_station_page(target_url: str, preferred_target: str = "") -> str:
+    deadline = time.time() + BROWSER_BRIDGE_TARGET_TIMEOUT_SECONDS
+    last_error = "station page not ready"
+    while time.time() <= deadline:
+        for item in _browser_bridge_tabs():
+            target = str(item.get("target", "")).strip()
+            if not target:
+                continue
+            if not str(item.get("url", "")).startswith(target_url):
+                continue
+            if preferred_target and target == preferred_target:
+                return target
+            if not preferred_target:
+                return target
+        time.sleep(1.0)
+    raise RuntimeError(last_error)
+
+
+def _browser_bridge_open_station_page(target_url: str) -> str:
+    station_page_target = ""
+    for item in _browser_bridge_tabs():
+        url = str(item.get("url", ""))
+        target = str(item.get("target", "")).strip()
+        if "/wilber3/find_stations/" in url and target:
+            station_page_target = target
+            break
+    if station_page_target:
+        _browser_bridge_json("browser_navigate", station_page_target, target_url)
+        return _browser_bridge_wait_for_station_page(target_url, station_page_target)
+
+    quickstart = _browser_bridge_json("browser_quickstart", target_url)
+    if isinstance(quickstart, dict):
+        target = str(quickstart.get("target", "")).strip()
+        if target:
+            return _browser_bridge_wait_for_station_page(target_url, target)
+    _browser_bridge_json("browser_open", target_url)
+    return _browser_bridge_wait_for_station_page(target_url)
+
+
+def _browser_bridge_wait_for_page_ready(target: str) -> None:
+    deadline = time.time() + BROWSER_BRIDGE_TARGET_TIMEOUT_SECONDS
+    last_error = "Wilber page not ready"
+    while time.time() <= deadline:
+        try:
+            ready = _browser_bridge_execute_js(target, "Boolean(window.Wilber && Wilber.page && Wilber.page.ready)")
+            if ready.strip().lower() == "true":
+                return
+            last_error = ready
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(1.0)
+    raise RuntimeError(last_error)
+
+
+def _wilber_page_selection_lines(
+    event: CandidateEvent,
+    pipeline_config: PipelineConfig,
+) -> tuple[list[str], int | None, int | None]:
+    _ensure_browser_bridge_ready()
+    target_url = f"{pipeline_config.event_search.wilber_base_url}/find_stations/{event.event_id}"
+    target = _browser_bridge_open_station_page(target_url)
+    _browser_bridge_wait_for_page_ready(target)
+    config = pipeline_config.request
+    request_label = build_request_label(config.request_label_prefix, event, config.channels)
+    script = f"""
+(() => {{
+  const page = window.Wilber && Wilber.page;
+  const dlg = page && page.dataRequestDialog;
+  if (!page || !page.ready) {{
+    throw new Error('Wilber page not ready');
+  }}
+  if (page.networkSelect && page.networkSelect.val) {{
+    page.networkSelect.val({json.dumps(config.networks)}).trigger('change');
+  }}
+  if (page.channelSelect && page.channelSelect.val) {{
+    page.channelSelect.val({json.dumps(config.channels)}).trigger('change');
+  }}
+  const setInput = (selector, value) => {{
+    const el = document.querySelector(selector);
+    if (el) el.value = String(value);
+  }};
+  setInput('input[name="distanceMin"]', {config.min_distance_deg});
+  setInput('input[name="distanceMax"]', {config.max_distance_deg});
+  setInput('input[name="azimuthMin"]', {config.min_azimuth_deg});
+  setInput('input[name="azimuthMax"]', {config.max_azimuth_deg});
+  setInput('input[name="lonMin"]', '');
+  setInput('input[name="lonMax"]', '');
+  setInput('input[name="latMin"]', '');
+  setInput('input[name="latMax"]', '');
+  if (dlg && dlg.windowStartBeforeSelect && dlg.windowStartBeforeSelect.val) {{
+    dlg.windowStartBeforeSelect.val(String({config.window_start_before_min}));
+  }}
+  if (dlg && dlg.windowStartPhaseSelect && dlg.windowStartPhaseSelect.val) {{
+    dlg.windowStartPhaseSelect.val({json.dumps(config.window_start_phase)});
+  }}
+  if (dlg && dlg.windowEndAfterSelect && dlg.windowEndAfterSelect.val) {{
+    dlg.windowEndAfterSelect.val(String({config.window_end_after_min}));
+  }}
+  if (dlg && dlg.windowEndPhaseSelect && dlg.windowEndPhaseSelect.val) {{
+    dlg.windowEndPhaseSelect.val({json.dumps(config.window_end_phase)});
+  }}
+  if (dlg && dlg.outputField && dlg.outputField.val) {{
+    dlg.outputField.val({json.dumps(config.output_format)});
+  }}
+  if (dlg && dlg.bundleField && dlg.bundleField.val) {{
+    dlg.bundleField.val({json.dumps(config.bundle)});
+  }}
+  if (dlg && dlg.userField && dlg.userField.val) {{
+    dlg.userField.val({json.dumps(config.user)});
+  }}
+  if (dlg && dlg.emailField && dlg.emailField.val) {{
+    dlg.emailField.val({json.dumps(config.email)});
+  }}
+  if (dlg && dlg.labelField && dlg.labelField.val) {{
+    dlg.labelField.val({json.dumps(request_label)});
+  }}
+  if (page.filterArgs) {{
+    page.filterArgs.networks = {json.dumps(config.networks)};
+    page.filterArgs.channels = {json.dumps(config.channels)};
+    page.filterArgs.distanceMin = {config.min_distance_deg};
+    page.filterArgs.distanceMax = {config.max_distance_deg};
+    page.filterArgs.azimuthMin = {config.min_azimuth_deg};
+    page.filterArgs.azimuthMax = {config.max_azimuth_deg};
+    page.filterArgs.lonMin = '';
+    page.filterArgs.lonMax = '';
+    page.filterArgs.latMin = '';
+    page.filterArgs.latMax = '';
+  }}
+  page.calculateFilterArgs();
+  page.updateFilter();
+  const selection = dlg._getSelection();
+  const requestInfo = dlg._getRequestInfo();
+  return JSON.stringify({{selection, requestInfo}});
+}})()
+"""
+    data = json.loads(_browser_bridge_execute_js(target, script))
+    if not isinstance(data, dict):
+        raise RuntimeError("Wilber page selection payload is not an object")
+    selection_lines = data.get("selection")
+    if not isinstance(selection_lines, list):
+        raise RuntimeError("Wilber page selection list missing")
+    request_info = data.get("requestInfo")
+    num_stations = None
+    num_channels = None
+    if isinstance(request_info, dict):
+        try:
+            num_stations = int(request_info.get("numStations")) if request_info.get("numStations") is not None else None
+        except (TypeError, ValueError):
+            num_stations = None
+        try:
+            num_channels = int(request_info.get("numChannels")) if request_info.get("numChannels") is not None else None
+        except (TypeError, ValueError):
+            num_channels = None
+    cleaned = [str(line).strip() for line in selection_lines if str(line).strip()]
+    return cleaned, num_stations, num_channels
+
+
 def select_preferred_location(
     station: StationRecord,
     channel_patterns: list[str],
     location_priority: list[str],
+    channel_selection_mode: str = "preferred",
 ) -> tuple[str, tuple[str, ...], int] | None:
-    candidates: list[tuple[int, str, tuple[str, ...]]] = []
+    mode = normalize_channel_selection_mode(channel_selection_mode)
+    candidates: list[tuple[int, int, str, tuple[str, ...]]] = []
     for location in station.locations:
         selected_channels = tuple(
             channel
@@ -550,13 +853,15 @@ def select_preferred_location(
         )
         if not selected_channels:
             continue
+        chosen_channels = selected_channels if mode == "all_matching" else _best_channels_for_location(selected_channels)
+        best_rank = _channel_priority_rank(chosen_channels[0])[0]
         code = "" if location.code == "--" else location.code
         priority_rank = location_priority.index(code) if code in location_priority else len(location_priority) + 1
-        candidates.append((priority_rank, code, selected_channels))
+        candidates.append((best_rank, priority_rank, code, chosen_channels))
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    _, code, channels = candidates[0]
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    _, _, code, channels = candidates[0]
     return code, channels, len(channels)
 
 
@@ -565,6 +870,7 @@ def select_stations_for_event(event: CandidateEvent, stations: list[StationRecor
     station_tokens = parse_filter_tokens(config.stations)
     channel_patterns = parse_filter_tokens(config.channels)
     location_priority = parse_location_priority(config.location_priority)
+    channel_selection_mode = normalize_channel_selection_mode(getattr(config, "channel_selection_mode", "preferred"))
 
     selected: list[SelectedStation] = []
     for station in stations:
@@ -575,42 +881,91 @@ def select_stations_for_event(event: CandidateEvent, stations: list[StationRecor
         location_codes, matching_channels, matching_channel_count = matching_channel_details(station, channel_patterns)
         if matching_channel_count == 0:
             continue
-        preferred = select_preferred_location(station, channel_patterns, location_priority)
-        if preferred is None:
-            continue
-        selected_location_code, selected_channels, selected_channel_count = preferred
-        distance_deg = float(locations2degrees(event.latitude, event.longitude, station.latitude, station.longitude))
-        if not (config.min_distance_deg <= distance_deg <= config.max_distance_deg):
-            continue
-        distance_m, azimuth, back_azimuth = gps2dist_azimuth(
-            event.latitude,
-            event.longitude,
-            station.latitude,
-            station.longitude,
-        )
-        signed_azimuth = signed_angle_deg(float(azimuth))
-        signed_back_azimuth = signed_angle_deg(float(back_azimuth))
-        if not (config.min_azimuth_deg <= signed_azimuth <= config.max_azimuth_deg):
-            continue
-        selected.append(
-            SelectedStation(
-                event_key=event.event_key,
-                output_event_id=event.output_event_id,
-                wilber_event_id=event.event_id,
-                wilber_event_time=event.event_time,
-                station=station,
-                distance_deg=distance_deg,
-                distance_km=distance_m / 1000.0,
-                azimuth=signed_azimuth,
-                back_azimuth=signed_back_azimuth,
-                selected_location_code=selected_location_code,
-                selected_channels=selected_channels,
-                selected_channel_count=selected_channel_count,
-                matching_location_codes=location_codes,
-                matching_channels=matching_channels,
-                matching_channel_count=matching_channel_count,
+
+        # 如果 location_priority 为空，则为每个匹配的 location 创建 SelectedStation
+        if not location_priority:
+            for location in station.locations:
+                selected_channels = tuple(
+                    channel
+                    for channel in location.channels
+                    if not channel_patterns or any(fnmatch.fnmatchcase(channel, pattern) for pattern in channel_patterns)
+                )
+                if not selected_channels:
+                    continue
+                if channel_selection_mode != "all_matching":
+                    selected_channels = _best_channels_for_location(selected_channels)
+                code = "" if location.code == "--" else location.code
+                distance_deg = float(locations2degrees(event.latitude, event.longitude, station.latitude, station.longitude))
+                if not (config.min_distance_deg <= distance_deg <= config.max_distance_deg):
+                    continue
+                distance_m, azimuth, back_azimuth = gps2dist_azimuth(
+                    event.latitude,
+                    event.longitude,
+                    station.latitude,
+                    station.longitude,
+                )
+                signed_azimuth = signed_angle_deg(float(azimuth))
+                signed_back_azimuth = signed_angle_deg(float(back_azimuth))
+                if not (config.min_azimuth_deg <= signed_azimuth <= config.max_azimuth_deg):
+                    continue
+                selected.append(
+                    SelectedStation(
+                        event_key=event.event_key,
+                        output_event_id=event.output_event_id,
+                        wilber_event_id=event.event_id,
+                        wilber_event_time=event.event_time,
+                        station=station,
+                        distance_deg=distance_deg,
+                        distance_km=distance_m / 1000.0,
+                        azimuth=signed_azimuth,
+                        back_azimuth=signed_back_azimuth,
+                        selected_location_code=code,
+                        channel_selection_mode=channel_selection_mode,
+                        selected_channels=selected_channels,
+                        selected_channel_count=len(selected_channels),
+                        matching_location_codes=location_codes,
+                        matching_channels=matching_channels,
+                        matching_channel_count=matching_channel_count,
+                    )
+                )
+        else:
+            preferred = select_preferred_location(station, channel_patterns, location_priority, channel_selection_mode=channel_selection_mode)
+            if preferred is None:
+                continue
+            selected_location_code, selected_channels, selected_channel_count = preferred
+            distance_deg = float(locations2degrees(event.latitude, event.longitude, station.latitude, station.longitude))
+            if not (config.min_distance_deg <= distance_deg <= config.max_distance_deg):
+                continue
+            distance_m, azimuth, back_azimuth = gps2dist_azimuth(
+                event.latitude,
+                event.longitude,
+                station.latitude,
+                station.longitude,
             )
-        )
+            signed_azimuth = signed_angle_deg(float(azimuth))
+            signed_back_azimuth = signed_angle_deg(float(back_azimuth))
+            if not (config.min_azimuth_deg <= signed_azimuth <= config.max_azimuth_deg):
+                continue
+            selected.append(
+                SelectedStation(
+                    event_key=event.event_key,
+                    output_event_id=event.output_event_id,
+                    wilber_event_id=event.event_id,
+                    wilber_event_time=event.event_time,
+                    station=station,
+                    distance_deg=distance_deg,
+                    distance_km=distance_m / 1000.0,
+                    azimuth=signed_azimuth,
+                    back_azimuth=signed_back_azimuth,
+                    selected_location_code=selected_location_code,
+                    channel_selection_mode=channel_selection_mode,
+                    selected_channels=selected_channels,
+                    selected_channel_count=selected_channel_count,
+                    matching_location_codes=location_codes,
+                    matching_channels=matching_channels,
+                    matching_channel_count=matching_channel_count,
+                )
+            )
     selected.sort(key=lambda item: (item.distance_deg, item.station.network, item.station.station))
     return selected
 
@@ -651,8 +1006,9 @@ def build_selection_lines(
         start_time = start_ref - request_config.window_start_before_min * 60.0
         end_time = end_ref + request_config.window_end_after_min * 60.0
         location_field = selected.selected_location_code or "*"
+        channel_field = ",".join(selected.selected_channels) or request_config.channels
         selection_lines.append(
-            f"{selected.station.network} {selected.station.station} {location_field} {request_config.channels} "
+            f"{selected.station.network} {selected.station.station} {location_field} {channel_field} "
             f"{format_ws_datetime(start_time)} {format_ws_datetime(end_time)}"
         )
     return selection_lines
@@ -673,8 +1029,9 @@ def build_selection_lines_from_rows(
         end_time = end_ref + request_config.window_end_after_min * 60.0
         location_code = row.get("SelectedLocationCode", "--").strip()
         location_field = "*" if location_code in {"", "--"} else location_code
+        channel_field = row.get("SelectedChannels", "").strip() or request_config.channels
         selection_lines.append(
-            f"{row['Network']} {row['Station']} {location_field} {request_config.channels} "
+            f"{row['Network']} {row['Station']} {location_field} {channel_field} "
             f"{format_ws_datetime(start_time)} {format_ws_datetime(end_time)}"
         )
     return selection_lines
@@ -710,7 +1067,7 @@ def query_events(
             )
             last_error = None
             break
-        except (URLError, TimeoutError, OSError) as exc:
+        except (URLError, TimeoutError, OSError, IncompleteRead) as exc:
             last_error = exc
             logger.warning(
                 "event search request failed on attempt %s/%s: %s",
@@ -852,6 +1209,7 @@ def _station_rows_for_selected(selected: list[SelectedStation]) -> list[dict[str
             "Station": item.station.station,
             "StationID": item.station.station_id,
             "SelectedLocationCode": item.selected_location_code or "--",
+            "ChannelSelectionMode": item.channel_selection_mode,
             "SelectedChannels": ",".join(item.selected_channels),
             "SelectedChannelCount": item.selected_channel_count,
             "MatchingLocationCodes": ",".join(code or "--" for code in item.matching_location_codes),
@@ -1004,6 +1362,7 @@ def _stations_stage_fingerprint(events: list[CandidateEvent], pipeline_config: P
                 "networks": pipeline_config.request.networks,
                 "stations": pipeline_config.request.stations,
                 "channels": pipeline_config.request.channels,
+                "channel_selection_mode": normalize_channel_selection_mode(pipeline_config.request.channel_selection_mode),
                 "location_priority": pipeline_config.request.location_priority,
                 "min_distance_deg": pipeline_config.request.min_distance_deg,
                 "max_distance_deg": pipeline_config.request.max_distance_deg,
@@ -1028,6 +1387,7 @@ def _requests_stage_fingerprint(selection_summary_rows: list[dict[str, str]], pi
             ],
             "request": {
                 "channels": pipeline_config.request.channels,
+                "channel_selection_mode": normalize_channel_selection_mode(pipeline_config.request.channel_selection_mode),
                 "networks": pipeline_config.request.networks,
                 "stations": pipeline_config.request.stations,
                 "location_priority": pipeline_config.request.location_priority,
@@ -1352,13 +1712,29 @@ def _build_request_plan_row(
 ) -> dict[str, object]:
     event_key = row["EventKey"]
     event = events[event_key]
-    selected_rows = load_csv_rows(workspace_root / "02_stations" / "per_event_selected" / f"{event_key}.csv")
+    station_csv_path = workspace_root / "02_stations" / "per_event_selected" / f"{event_key}.csv"
+    selected_rows = load_csv_rows(station_csv_path) if station_csv_path.exists() else []
     station_count = len(selected_rows)
     selected_channel_count = sum(int(item.get("SelectedChannelCount") or "0") for item in selected_rows)
     request_label = build_request_label(pipeline_config.request.request_label_prefix, event, pipeline_config.request.channels)
     request_body_path = request_body_dir / f"{event_key}.txt"
+    station_csv_path_text = str(station_csv_path) if station_csv_path.exists() else ""
+    selection_backend = normalize_station_selection_backend(pipeline_config.request.station_selection_backend)
+    selection_lines: list[str] | None = None
 
-    if station_count == 0:
+    if selection_backend == "wilber_page":
+        try:
+            selection_lines, page_station_count, page_channel_count = _wilber_page_selection_lines(event, pipeline_config)
+            station_count = page_station_count if page_station_count is not None else len(selection_lines)
+            if page_channel_count is not None:
+                selected_channel_count = page_channel_count
+            elif selected_channel_count == 0:
+                selected_channel_count = len(selection_lines)
+        except Exception:
+            if not selected_rows:
+                raise
+
+    if selection_lines is None and station_count == 0:
         request_body_path.write_text("", encoding="utf-8")
         return {
             "event_key": event_key,
@@ -1371,6 +1747,7 @@ def _build_request_plan_row(
                 "Networks": pipeline_config.request.networks,
                 "Stations": pipeline_config.request.stations,
                 "Channels": pipeline_config.request.channels,
+                "ChannelSelectionMode": normalize_channel_selection_mode(pipeline_config.request.channel_selection_mode),
                 "DistanceMinDeg": pipeline_config.request.min_distance_deg,
                 "DistanceMaxDeg": pipeline_config.request.max_distance_deg,
                 "AzimuthMinDeg": pipeline_config.request.min_azimuth_deg,
@@ -1385,7 +1762,7 @@ def _build_request_plan_row(
                 "Email": pipeline_config.request.email,
                 "SelectedStationCount": 0,
                 "SelectedChannelCount": 0,
-                "StationCsvPath": str(workspace_root / "02_stations" / "per_event_selected" / f"{event_key}.csv"),
+                "StationCsvPath": station_csv_path_text,
                 "RequestBodyPath": str(request_body_path),
                 "SubmitStatus": "no_station_selected",
                 "TrackURL": "",
@@ -1400,8 +1777,53 @@ def _build_request_plan_row(
             "error": "",
         }
 
-    model = TauPyModel(model="iasp91")
-    selection_lines = build_selection_lines_from_rows(event, selected_rows, pipeline_config.request, model)
+    if selection_lines is None:
+        model = TauPyModel(model="iasp91")
+        selection_lines = build_selection_lines_from_rows(event, selected_rows, pipeline_config.request, model)
+
+    if not selection_lines:
+        request_body_path.write_text("", encoding="utf-8")
+        return {
+            "event_key": event_key,
+            "plan_row": {
+                "EventKey": event_key,
+                "OutputEventID": event.output_event_id,
+                "WilberEventID": event.event_id,
+                "WilberEventTimeUTC": str(event.event_time),
+                "RequestLabel": request_label,
+                "Networks": pipeline_config.request.networks,
+                "Stations": pipeline_config.request.stations,
+                "Channels": pipeline_config.request.channels,
+                "ChannelSelectionMode": normalize_channel_selection_mode(pipeline_config.request.channel_selection_mode),
+                "DistanceMinDeg": pipeline_config.request.min_distance_deg,
+                "DistanceMaxDeg": pipeline_config.request.max_distance_deg,
+                "AzimuthMinDeg": pipeline_config.request.min_azimuth_deg,
+                "AzimuthMaxDeg": pipeline_config.request.max_azimuth_deg,
+                "WindowStartBeforeMin": pipeline_config.request.window_start_before_min,
+                "WindowStartPhase": pipeline_config.request.window_start_phase,
+                "WindowEndAfterMin": pipeline_config.request.window_end_after_min,
+                "WindowEndPhase": pipeline_config.request.window_end_phase,
+                "OutputFormat": pipeline_config.request.output_format,
+                "Bundle": pipeline_config.request.bundle,
+                "User": pipeline_config.request.user,
+                "Email": pipeline_config.request.email,
+                "SelectedStationCount": 0,
+                "SelectedChannelCount": 0,
+                "StationCsvPath": station_csv_path_text,
+                "RequestBodyPath": str(request_body_path),
+                "SubmitStatus": "no_station_selected",
+                "TrackURL": "",
+                "SubmitMessage": "no station matched the configured filters",
+                "RequestedAtUTC": "",
+            },
+            "prepared": 0,
+            "submitted": 0,
+            "failed": 0,
+            "retry_count": 0,
+            "status": "completed",
+            "error": "",
+        }
+
     request_body_path.write_text("\n".join(selection_lines) + "\n", encoding="utf-8")
 
     submit_status = "not_submitted"
@@ -1428,7 +1850,7 @@ def _build_request_plan_row(
                 )
                 requested_at = UTCDateTime().strftime("%Y-%m-%dT%H:%M:%SZ")
                 break
-            except (URLError, TimeoutError, OSError) as exc:
+            except (URLError, TimeoutError, OSError, IncompleteRead) as exc:
                 retry_count += 1
                 submit_status = "submit_request_failed"
                 submit_message = f"attempt_{attempt}: {exc}"
@@ -1450,6 +1872,7 @@ def _build_request_plan_row(
             "Networks": pipeline_config.request.networks,
             "Stations": pipeline_config.request.stations,
             "Channels": pipeline_config.request.channels,
+            "ChannelSelectionMode": normalize_channel_selection_mode(pipeline_config.request.channel_selection_mode),
             "DistanceMinDeg": pipeline_config.request.min_distance_deg,
             "DistanceMaxDeg": pipeline_config.request.max_distance_deg,
             "AzimuthMinDeg": pipeline_config.request.min_azimuth_deg,
@@ -1464,7 +1887,7 @@ def _build_request_plan_row(
             "Email": pipeline_config.request.email,
             "SelectedStationCount": station_count,
             "SelectedChannelCount": selected_channel_count,
-            "StationCsvPath": str(workspace_root / "02_stations" / "per_event_selected" / f"{event_key}.csv"),
+            "StationCsvPath": station_csv_path_text,
             "RequestBodyPath": str(request_body_path),
             "SubmitStatus": submit_status,
             "TrackURL": track_url,
@@ -1500,6 +1923,7 @@ def _build_failed_request_plan_row(
             "Networks": pipeline_config.request.networks,
             "Stations": pipeline_config.request.stations,
             "Channels": pipeline_config.request.channels,
+            "ChannelSelectionMode": normalize_channel_selection_mode(pipeline_config.request.channel_selection_mode),
             "DistanceMinDeg": pipeline_config.request.min_distance_deg,
             "DistanceMaxDeg": pipeline_config.request.max_distance_deg,
             "AzimuthMinDeg": pipeline_config.request.min_azimuth_deg,
@@ -1583,8 +2007,23 @@ def build_requests(
     request_body_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
 
-    events = {event.event_key: event for event in load_events_from_csv(workspace_root / "01_events" / "events.csv")}
-    selection_summary_rows = load_csv_rows(workspace_root / "02_stations" / "event_station_summary.csv")
+    events_list = load_events_from_csv(workspace_root / "01_events" / "events.csv")
+    events = {event.event_key: event for event in events_list}
+    selection_backend = normalize_station_selection_backend(pipeline_config.request.station_selection_backend)
+    if selection_backend == "wilber_page":
+        selection_summary_rows = [
+            {
+                "EventKey": event.event_key,
+                "OutputEventID": event.output_event_id,
+                "WilberEventID": str(event.event_id),
+                "SelectedStationCount": "",
+                "SelectedChannelCount": "",
+                "PerEventCsvPath": "",
+            }
+            for event in events_list
+        ]
+    else:
+        selection_summary_rows = load_csv_rows(workspace_root / "02_stations" / "event_station_summary.csv")
     plan_rows: list[dict[str, object]] = []
     submitted_count = 0
     prepared_count = 0
@@ -1642,13 +2081,13 @@ def build_requests(
             reusable_results[event_key] = _request_reuse_result_from_meta(event_key, fallback_meta)
 
     pending_rows = [(index, row) for index, row in enumerate(selection_summary_rows, start=1) if row.get("EventKey", "") not in reusable_event_keys]
-    max_workers = _worker_count(
-        len(pending_rows),
-        REQUEST_STAGE_MAX_WORKERS if pipeline_config.request.submit else STATION_STAGE_MAX_WORKERS,
-    )
+    worker_limit = REQUEST_STAGE_MAX_WORKERS if pipeline_config.request.submit else STATION_STAGE_MAX_WORKERS
+    if selection_backend == "wilber_page":
+        worker_limit = 1
+    max_workers = _worker_count(len(pending_rows), worker_limit)
     logger.info(
         "request planning using %s workers for %s pending events (%s reused)",
-        _worker_count(len(pending_rows), REQUEST_STAGE_MAX_WORKERS if pipeline_config.request.submit else STATION_STAGE_MAX_WORKERS),
+        max_workers,
         len(pending_rows),
         len(reusable_event_keys),
     )
@@ -1684,10 +2123,7 @@ def build_requests(
     reused_request_count = len(reusable_event_keys)
 
     if pending_rows:
-        effective_workers = _worker_count(
-            len(pending_rows),
-            REQUEST_STAGE_MAX_WORKERS if pipeline_config.request.submit else STATION_STAGE_MAX_WORKERS,
-        )
+        effective_workers = max_workers
         with ThreadPoolExecutor(max_workers=effective_workers, thread_name_prefix="wilber-requests") as executor:
             future_map = {
                 executor.submit(
