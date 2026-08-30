@@ -7,6 +7,7 @@ import imaplib
 import os
 import re
 import time
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta, timezone
 from email.message import Message
 from email.utils import parsedate_to_datetime
@@ -128,6 +129,15 @@ def earliest_request_time(expected_requests: dict[str, dict[str, str]]) -> datet
     return min(values)
 
 
+def request_label_prefixes(expected_requests: dict[str, dict[str, str]]) -> tuple[str, ...]:
+    prefixes: set[str] = set()
+    for label in expected_requests:
+        parts = label.split("_")
+        if len(parts) >= 4:
+            prefixes.add("_".join(parts[:4]))
+    return tuple(sorted(prefixes))
+
+
 def consistency_check(label: str, expected_requests: dict[str, dict[str, str]]) -> tuple[str, str, str, str]:
     expected = expected_requests.get(label)
     if expected is None:
@@ -140,7 +150,44 @@ def consistency_check(label: str, expected_requests: dict[str, dict[str, str]]) 
     )
 
 
-def _search_message_ids(client, criteria: list[str], max_messages: int, logger=None) -> list[bytes]:
+def _bounded_recent_hours(config: MailConfig) -> int:
+    return max(1, min(config.message_lookback_hours, 1))
+
+
+def _build_search_groups(
+    config: MailConfig,
+    requested_min_dt: datetime | None,
+    expected_requests: dict[str, dict[str, str]],
+) -> list[tuple[str, list[str]]]:
+    groups: list[tuple[str, list[str]]] = []
+    base_criteria: list[str] = []
+    if config.from_substring.strip():
+        base_criteria.extend(["FROM", config.from_substring.strip()])
+    if config.subject_substring.strip():
+        base_criteria.extend(["SUBJECT", config.subject_substring.strip()])
+
+    since_dt = requested_min_dt.astimezone(UTC) if requested_min_dt is not None else datetime.now(UTC) - timedelta(hours=_bounded_recent_hours(config))
+    recent_since = max(datetime.now(UTC) - timedelta(hours=_bounded_recent_hours(config)), since_dt)
+    recent_date = recent_since.strftime("%d-%b-%Y")
+    lookback_date = since_dt.strftime("%d-%b-%Y")
+
+    prefixes = request_label_prefixes(expected_requests)
+    for prefix in prefixes:
+        criteria = [*base_criteria, "SINCE", recent_date, "TEXT", prefix]
+        groups.append((f"recent-prefix:{prefix}", criteria))
+
+    if prefixes:
+        groups.append(("recent-base", [*base_criteria, "SINCE", recent_date]))
+    else:
+        groups.append(("recent-base", [*base_criteria, "SINCE", recent_date]))
+
+    if lookback_date != recent_date:
+        groups.append(("lookback-base", [*base_criteria, "SINCE", lookback_date]))
+
+    return groups
+
+
+def _search_message_ids(client, search_groups: Iterable[tuple[str, list[str]]], max_messages: int, logger=None) -> list[bytes]:
     collected: list[bytes] = []
     seen: set[bytes] = set()
 
@@ -153,20 +200,35 @@ def _search_message_ids(client, criteria: list[str], max_messages: int, logger=N
             seen.add(message_id)
             collected.append(message_id)
 
-    searches: list[tuple[str, list[str]]] = []
-    if criteria:
-        searches.append(("targeted", criteria))
-    searches.append(("all", ["ALL"]))
-
-    for label, search_args in searches:
+    for label, search_args in search_groups:
         status, data = client.search(None, *search_args)
         if logger is not None:
             logger.info("IMAP %s search criteria=%s status=%s", label, " ".join(search_args), status)
         if status != "OK" or not data:
             continue
         extend_ids(data[0] if data else None)
+        if len(collected) >= max_messages:
+            break
 
     return collected[:max_messages]
+
+
+def _text_from_fetch(fetched) -> str:
+    for item in fetched:
+        if isinstance(item, tuple) and len(item) == 2:
+            payload = item[1]
+            if isinstance(payload, bytes):
+                return payload.decode("utf-8", errors="replace")
+            if isinstance(payload, str):
+                return payload
+    return ""
+
+
+def _text_mentions_expected_label(text: str, expected_labels: set[str], expected_prefixes: tuple[str, ...]) -> bool:
+    haystack = text.lower()
+    if any(label in haystack for label in expected_labels):
+        return True
+    return any(prefix in haystack for prefix in expected_prefixes)
 
 
 def poll_sleep_seconds(config: MailConfig, round_index: int) -> int:
@@ -196,16 +258,8 @@ def fetch_matches(config: MailConfig, expected_requests: dict[str, dict[str, str
             raise RuntimeError(f"failed to open mailbox: {config.mailbox}")
         client.noop()
 
-        search_criteria: list[str] = []
-        if config.from_substring.strip():
-            search_criteria.extend(["FROM", config.from_substring.strip()])
-        if config.subject_substring.strip():
-            search_criteria.extend(["SUBJECT", config.subject_substring.strip()])
-        if requested_min_dt is not None:
-            imap_since_dt = requested_min_dt.astimezone(timezone.utc)
-            search_criteria.extend(["SINCE", imap_since_dt.strftime("%d-%b-%Y")])
-
-        message_ids = _search_message_ids(client, search_criteria, config.max_messages, logger=logger)
+        search_groups = _build_search_groups(config, requested_min_dt, expected_requests)
+        message_ids = _search_message_ids(client, search_groups, config.max_messages, logger=logger)
         if not message_ids:
             return []
 
@@ -213,7 +267,15 @@ def fetch_matches(config: MailConfig, expected_requests: dict[str, dict[str, str
             logger.info("IMAP search returned %s candidate messages", len(message_ids))
 
         matches: dict[str, MailMatch] = {}
+        expected_labels = set(expected_requests)
+        expected_prefixes = request_label_prefixes(expected_requests)
         for message_id in message_ids:
+            status, text_fetched = client.fetch(message_id, "(BODY.PEEK[TEXT]<0.4096>)")
+            if status != "OK" or not text_fetched:
+                continue
+            text_preview = _text_from_fetch(text_fetched)
+            if not _text_mentions_expected_label(text_preview, expected_labels, expected_prefixes):
+                continue
             status, fetched = client.fetch(message_id, "(RFC822)")
             if status != "OK" or not fetched:
                 continue
