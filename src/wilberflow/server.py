@@ -26,7 +26,7 @@ from .common import (
 )
 from .config import copy_config_into_workspace, load_config
 from .notify import build_feishu_workflow_message, send_feishu_text_message, should_send_feishu_notification
-from .pipeline import prepare_workspace, run_all, run_resume_from_mail, workflow_stage_sequence
+from .pipeline import prepare_workspace, run_all, run_download_extract_only, run_resume_from_mail, run_until_extract, workflow_stage_sequence
 from .wilber import (
     attach_virtual_networks,
     fetch_station_records_for_time,
@@ -215,6 +215,91 @@ def _with_batched_request_label_prefix(config_toml: str, batch_id: str) -> str:
     if in_request_section and not replaced:
         lines.append(f"request_label_prefix = {_toml_quote(f'wilberflow_{batch_id}')}")
     return "\n".join(lines) + ("\n" if config_toml.endswith("\n") else "")
+
+
+def _with_request_submit_enabled(config_toml: str) -> str:
+    lines = config_toml.splitlines()
+    in_request_section = False
+    replaced = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_request_section and not replaced:
+                lines.insert(index, "submit = true")
+                replaced = True
+                break
+            in_request_section = stripped == "[request]"
+            continue
+        if not in_request_section or not stripped.startswith("submit"):
+            continue
+        lines[index] = "submit = true"
+        replaced = True
+        break
+    if in_request_section and not replaced:
+        lines.append("submit = true")
+    return "\n".join(lines) + ("\n" if config_toml.endswith("\n") else "")
+
+
+def _with_metadata_only_disabled(config_toml: str) -> str:
+    lines = config_toml.splitlines()
+    in_request_section = False
+    replaced = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_request_section and not replaced:
+                lines.insert(index, "metadata_only = false")
+                replaced = True
+                break
+            in_request_section = stripped == "[request]"
+            continue
+        if not in_request_section or not stripped.startswith("metadata_only"):
+            continue
+        lines[index] = "metadata_only = false"
+        replaced = True
+        break
+    if in_request_section and not replaced:
+        lines.append("metadata_only = false")
+    return "\n".join(lines) + ("\n" if config_toml.endswith("\n") else "")
+
+
+def _with_request_submit_disabled(config_toml: str) -> str:
+    lines = config_toml.splitlines()
+    in_request_section = False
+    replaced = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_request_section and not replaced:
+                lines.insert(index, "submit = false")
+                replaced = True
+                break
+            in_request_section = stripped == "[request]"
+            continue
+        if not in_request_section or not stripped.startswith("submit"):
+            continue
+        lines[index] = "submit = false"
+        replaced = True
+        break
+    if in_request_section and not replaced:
+        lines.append("submit = false")
+    return "\n".join(lines) + ("\n" if config_toml.endswith("\n") else "")
+
+
+def _read_request_value(config_toml: str, key: str) -> str | None:
+    in_request_section = False
+    for raw_line in config_toml.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_request_section = stripped == "[request]"
+            continue
+        if not in_request_section or "=" not in stripped:
+            continue
+        left, right = stripped.split("=", 1)
+        if left.strip() != key:
+            continue
+        return right.strip().strip('"').strip("'")
+    return None
 
 
 def _resolve_batch_workspace(
@@ -468,7 +553,7 @@ def build_search_query(params: dict[str, list[str]]) -> tuple[dict[str, object],
 
     query.setdefault("orderby", "time-asc")
     query["output"] = "text"
-    query["limit"] = min(max(_maybe_int(_single_param(params, "limit", "200")) or 200, 1), 2000)
+    query["limit"] = min(max(_maybe_int(_single_param(params, "limit", "200")) or 200, 1), 20000)
     return query, dataset
 
 
@@ -732,16 +817,27 @@ def _run_workflow_in_background(
     def worker() -> None:
         logger = None
         try:
-            if mode == "resume_from_mail" or not config_toml.strip():
+            if mode == "resume_from_mail" or mode == "resume_from_mail_extract_only" or not config_toml.strip():
                 config_path = workspace_root / ".wilberflow-studio" / "runtime_config.toml"
                 if not config_path.exists():
                     raise FileNotFoundError(f"missing runtime config for resume: {config_path}")
+            elif mode == "run_until_extract":
+                config_path = _write_runtime_config(
+                    workspace_root,
+                    _with_batched_request_label_prefix(_with_metadata_only_disabled(_with_request_submit_enabled(config_toml)), batch_id),
+                )
             else:
                 config_path = _write_runtime_config(workspace_root, _with_batched_request_label_prefix(config_toml, batch_id))
             logger = setup_logger(workspace_root / "logs" / "pipeline.log", logger_name=f"wilberflow-runner-{workspace_root}")
+            mode_message_map = {
+                "run_all": "本地流程运行中",
+                "run_until_extract": "正在运行到解压阶段",
+                "resume_from_mail": "正在补跑收信与下载后半程",
+                "resume_from_mail_extract_only": "正在补跑收信、下载与解压",
+            }
             update_workflow_state(
                 status="running",
-                message="本地流程运行中" if mode == "run_all" else "正在补跑收信与下载后半程",
+                message=mode_message_map.get(mode, "本地流程运行中"),
                 batch_id=batch_id,
                 workspace_base_root=str(workspace_base_root),
                 workspace_root=str(workspace_root),
@@ -855,6 +951,24 @@ def _run_workflow_in_background(
                     mail_progress_callback=mail_progress_callback,
                     stage_progress_callback=stage_progress_callback,
                 )
+            elif mode == "run_until_extract":
+                run_until_extract(
+                    workspace_root,
+                    pipeline_config,
+                    logger,
+                    stage_callback=stage_callback,
+                    mail_progress_callback=mail_progress_callback,
+                    stage_progress_callback=stage_progress_callback,
+                )
+            elif mode == "resume_from_mail_extract_only":
+                run_download_extract_only(
+                    workspace_root,
+                    pipeline_config,
+                    logger,
+                    stage_callback=stage_callback,
+                    mail_progress_callback=mail_progress_callback,
+                    stage_progress_callback=stage_progress_callback,
+                )
             else:
                 run_all(
                     workspace_root,
@@ -870,11 +984,18 @@ def _run_workflow_in_background(
                 stage_sequence[-1]["key"] if stage_sequence else "",
             )
             finished_at = _utc_now().isoformat().replace("+00:00", "Z")
+            completed_message_map = {
+                "run_all": "流程已完成",
+                "run_until_extract": "运行到解压阶段已完成",
+                "resume_from_mail": "补跑已完成",
+                "resume_from_mail_extract_only": "只下载后解压已完成",
+                "download_extract_only": "只下载后解压已完成",
+            }
             update_workflow_state(
                 status="completed",
-                message="流程已完成" if mode == "run_all" else "补跑已完成",
+                message=completed_message_map.get(mode, "流程已完成"),
                 mode=mode,
-                stage_sequence=stage_sequence,
+                stage_sequence=final_progress if isinstance(final_progress, dict) else stage_progress,
                 stage_progress=final_progress,
                 current_stage_key=stage_sequence[-1]["key"] if stage_sequence else "",
                 batch_id=batch_id,
@@ -890,7 +1011,7 @@ def _run_workflow_in_background(
                 workspace_root=workspace_root,
                 log_path=workspace_root / "logs" / "pipeline.log",
                 finished_at_utc=finished_at,
-                detail="流程已完成" if mode == "run_all" else "补跑已完成",
+                detail=completed_message_map.get(mode, "流程已完成"),
                 logger=logger,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1066,6 +1187,7 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                 config_toml = str(payload.get("config_toml", ""))
                 request_email = str(payload.get("request_email", "")).strip()
                 qq_imap_auth_code = str(payload.get("qq_imap_auth_code", ""))
+                mode = str(payload.get("mode", "run_all")).strip() or "run_all"
                 if not config_toml.strip():
                     self._send_error_json(HTTPStatus.BAD_REQUEST, "missing config_toml")
                     return
@@ -1078,15 +1200,23 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                     batch_id_text,
                     create_new_if_missing=True,
                 )
+                if mode == "run_until_extract":
+                    config_toml = _with_metadata_only_disabled(_with_request_submit_enabled(config_toml))
+                elif mode == "run_all":
+                    backend = (_read_request_value(config_toml, "station_selection_backend") or "").strip().lower()
+                    metadata_only = (_read_request_value(config_toml, "metadata_only") or "").strip().lower() == "true"
+                    if metadata_only and backend in {"wilber_page", "wilber-page", "browser"}:
+                        config_toml = _with_request_submit_disabled(config_toml)
                 runtime_config_path, copied_config_path = _persist_workspace_config(
                     workspace_root,
                     config_toml,
                     resolved_batch_id,
                 )
+                queued_message = "新建批次并运行到解压任务已提交，等待启动" if mode == "run_until_extract" else "流程已提交，等待启动"
                 update_workflow_state(
                     status="queued",
-                    message="流程已提交，等待启动",
-                    mode="run_all",
+                    message=queued_message,
+                    mode=mode,
                     stage_sequence=[],
                     stage_progress={},
                     current_stage_key="",
@@ -1105,17 +1235,19 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                     workspace_base_root,
                     workspace_root,
                     resolved_batch_id,
-                    "",
+                    config_toml,
                     request_email,
                     qq_imap_auth_code,
+                    mode=mode,
                 )
                 self._send_json(
                     {
                         "ok": True,
-                        "message": "流程已启动",
+                        "message": "新建批次并运行到解压任务已启动" if mode == "run_until_extract" else "流程已启动",
                         "batch_id": resolved_batch_id,
                         "workspace_base_root": str(workspace_base_root),
                         "workspace_root": str(workspace_root),
+                        "mode": mode,
                         "runtime_config_path": str(runtime_config_path),
                         "copied_config_path": str(copied_config_path),
                         "log_path": str(workspace_root / "logs" / "pipeline.log"),
@@ -1180,9 +1312,10 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                     batch_id_text,
                     create_new_if_missing=False,
                 )
-                runtime_config_path = workspace_root / ".wilberflow-studio" / "runtime_config.toml"
-                if not runtime_config_path.exists():
-                    self._send_error_json(HTTPStatus.BAD_REQUEST, f"missing runtime config: {runtime_config_path}")
+                try:
+                    _resume_batch_preflight(workspace_root)
+                except FileNotFoundError as exc:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
                     return
                 update_workflow_state(
                     status="queued",
@@ -1225,6 +1358,69 @@ class WilberStudioHandler(SimpleHTTPRequestHandler):
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error_json(HTTPStatus.BAD_GATEWAY, f"resume workflow failed: {exc}")
+            return
+        if parsed.path == "/api/workflow/resume-mail-extract":
+            try:
+                payload = self._read_json_body()
+                workspace_root_text = str(payload.get("workspace_root", "")).strip() or str(_default_workspace_root())
+                batch_mode = str(payload.get("batch_mode", "existing")).strip() or "existing"
+                batch_id_text = str(payload.get("batch_id", "")).strip()
+                request_email = str(payload.get("request_email", "")).strip()
+                qq_imap_auth_code = str(payload.get("qq_imap_auth_code", ""))
+                if workflow_running():
+                    self._send_error_json(HTTPStatus.CONFLICT, "another workflow is already running")
+                    return
+                workspace_base_root, workspace_root, resolved_batch_id = _resolve_batch_workspace(
+                    workspace_root_text,
+                    batch_mode,
+                    batch_id_text,
+                    create_new_if_missing=False,
+                )
+                runtime_config_path = workspace_root / ".wilberflow-studio" / "runtime_config.toml"
+                if not runtime_config_path.exists():
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, f"missing runtime config: {runtime_config_path}")
+                    return
+                update_workflow_state(
+                    status="queued",
+                    message="只下载后解压任务已提交，等待启动",
+                    mode="resume_from_mail_extract_only",
+                    stage_sequence=[],
+                    stage_progress={},
+                    current_stage_key="",
+                    batch_id=resolved_batch_id,
+                    workspace_base_root=str(workspace_base_root),
+                    mail_expected_count=0,
+                    mail_received_count=0,
+                    mail_pending_count=0,
+                    mail_progress_note="",
+                    workspace_root=str(workspace_root),
+                    started_at_utc=None,
+                    finished_at_utc=None,
+                    log_path=str(workspace_root / "logs" / "pipeline.log"),
+                )
+                _run_workflow_in_background(
+                    workspace_base_root,
+                    workspace_root,
+                    resolved_batch_id,
+                    "",
+                    request_email,
+                    qq_imap_auth_code,
+                    mode="resume_from_mail_extract_only",
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "message": "只下载后解压任务已启动",
+                        "batch_id": resolved_batch_id,
+                        "workspace_base_root": str(workspace_base_root),
+                        "workspace_root": str(workspace_root),
+                        "log_path": str(workspace_root / "logs" / "pipeline.log"),
+                    }
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                self._send_error_json(HTTPStatus.BAD_GATEWAY, f"resume download-extract failed: {exc}")
             return
         self._send_error_json(HTTPStatus.NOT_FOUND, "unknown endpoint")
 

@@ -9,6 +9,7 @@ from .export_final import default_export_roots, export_final_layout
 from .pipeline import (
     prepare_workspace,
     run_all,
+    run_dedup,
     run_extraction,
     run_mail_polling,
     run_normalize,
@@ -17,6 +18,7 @@ from .pipeline import (
     run_resume_from_mail,
     run_search,
     run_station_selection,
+    run_until_extract,
 )
 from .server import serve
 
@@ -32,7 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
         "download-packages",
         "extract-packages",
         "normalize",
+        "dedup",
         "resume-from-mail",
+        "run-until-extract",
         "run-all",
     ]:
         sub = subparsers.add_parser(command)
@@ -86,8 +90,12 @@ def main() -> None:
         run_extraction(args.workspace_root, pipeline_config, logger)
     elif args.command == "normalize":
         run_normalize(args.workspace_root, pipeline_config, logger)
+    elif args.command == "dedup":
+        run_dedup(args.workspace_root, pipeline_config, logger)
     elif args.command == "resume-from-mail":
         run_resume_from_mail(args.workspace_root, pipeline_config, logger)
+    elif args.command == "run-until-extract":
+        run_until_extract(args.workspace_root, pipeline_config, logger)
     elif args.command == "run-all":
         run_all(args.workspace_root, pipeline_config, logger)
     elif args.command == "export-final":

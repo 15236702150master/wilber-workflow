@@ -22,6 +22,19 @@ const FALLBACK_STAGE_SEQUENCES = {
     { key: "response", label: "去仪器响应" },
     { key: "deliver", label: "整理交付" },
   ],
+  resume_from_mail_extract_only: [
+    { key: "mail", label: "检查邮件" },
+    { key: "download", label: "下载数据" },
+    { key: "extract", label: "解压数据" },
+  ],
+  run_until_extract: [
+    { key: "events", label: "搜索事件" },
+    { key: "stations", label: "筛选台站" },
+    { key: "requests", label: "生成请求" },
+    { key: "mail", label: "检查邮件" },
+    { key: "download", label: "下载数据" },
+    { key: "extract", label: "解压数据" },
+  ],
 };
 
 const DEFAULT_SETTINGS = {
@@ -34,13 +47,14 @@ const DEFAULT_SETTINGS = {
   max_depth_km: "700",
   latitude_range: "-60, 60",
   longitude_range: "-180, 180",
-  limit_events: "3",
+  limit_events: "",
   selected_event_tokens: "",
   metadata_only: false,
   network_patterns: "",
   station_patterns: "",
   channel_patterns: "BH?",
-  location_priority: "00,--,10",
+  channel_selection_mode: "preferred",
+  location_priority: "",
   min_distance_deg: "30",
   max_distance_deg: "95",
   min_azimuth_deg: "-180",
@@ -80,14 +94,15 @@ const FIELD_HELP = {
   max_depth_km: "事件最大深度，单位 km；常用值是 700。",
   latitude_range: "格式是“最小纬度, 最大纬度”，例如 -60, 60。",
   longitude_range: "格式是“最小经度, 最大经度”，例如 -180, 180。",
-  limit_events: "本轮最多处理多少个事件；填 0 表示不限制。建议先用 1 到 3 做测试。",
-  selected_event_tokens: "这里是最终会参与流程的事件名单。点击“搜索 Wilber 事件”后，返回结果会默认全选并自动写入这里；你取消勾选某些事件时，这里会同步减少。你也可以直接在文本框里手动增删事件。",
+  limit_events: "留空表示全部匹配事件；如果只想先试跑少量，建议填 1 到 3。",
+  selected_event_tokens: "这里是最终会参与流程的事件名单。点击“搜索 Wilber 事件”后，返回结果会默认全选并自动写入这里；你取消勾选某些事件时，这里会同步减少。你也可以直接在文本框里手动增删事件；如果你粘贴的是部分时间串或不同格式的事件名，可以先点“审批事件名单”按当前搜索结果对齐。",
   selected_regions: "这里列出当前搜索结果里出现的所有地区名称，默认全选。你可以只保留本轮想处理的地区。",
   metadata_only: "勾选后，本轮只生成事件 CSV 和台站 CSV，不提交 Wilber 请求、不查邮件、不下载数据，也不做去响应和最终整理。适合先批量拿事件与台站对应关系做筛查。",
   network_patterns: "留空表示每个事件都不限制台网，也就是该事件可用台网全部参与，不只限于目录里的 500 个常见台网。下拉目录只是为了方便快速勾选常见台网。",
   station_patterns: "台站支持写 STA 或 NET.STA，也支持通配符，例如 ANMO、COLA、A*。留空表示不过滤。",
   channel_patterns: "这里可以直接手动输入任意 Wilber 支持的通道通配符；下拉分类只是快捷选择，不是白名单。常见例子有 BH?、BHZ、?HZ、HHZ、LH?，多个模式可用逗号分隔。",
-  location_priority: "按优先级填写 location code，例如 00,--,10。越靠前越优先。",
+  channel_selection_mode: "控制同一台站最终保留一个优先通道，还是保留该台站 location 下所有匹配通道。这个设置会真正写入运行配置并影响后端下载逻辑。",
+  location_priority: "留空表示全部下载；填写 location code 按优先级选择，例如 00,--,10。越靠前越优先。",
   min_distance_deg: "台站到事件的最小震中距，单位度，例如 30 或 35。",
   max_distance_deg: "台站到事件的最大震中距，单位度，例如 95。",
   min_azimuth_deg: "最小方位角，单位度。默认 -180，表示不限制下边界。",
@@ -125,6 +140,7 @@ const eventDatasetSelect = document.getElementById("event-dataset");
 const searchEventsButton = document.getElementById("search-events");
 const eventSearchStatus = document.getElementById("event-search-status");
 const eventResults = document.getElementById("event-results");
+const approveSelectedEventsButton = document.getElementById("approve-selected-events");
 const selectedEventsStatus = document.getElementById("selected-events-status");
 const regionFilterSearch = document.getElementById("region-filter-search");
 const regionFilterList = document.getElementById("region-filter-list");
@@ -146,6 +162,7 @@ const networkCloseDropdownButton = document.getElementById("network-close-dropdo
 const saveWorkspaceConfigButton = document.getElementById("save-workspace-config");
 const runWorkflowButton = document.getElementById("run-workflow");
 const resumeMailWorkflowButton = document.getElementById("resume-mail-workflow");
+const runUntilExtractWorkflowButton = document.getElementById("run-until-extract-workflow");
 const workflowStatus = document.getElementById("workflow-status");
 const workflowStagebar = document.getElementById("workflow-stagebar");
 const batchCatalogRefreshButton = document.getElementById("batch-catalog-refresh");
@@ -505,6 +522,15 @@ function tomlLimitValue(value, fallback) {
   return numeric <= 0 ? 0 : numeric;
 }
 
+function queryLimitValue(value, fallback) {
+  const numeric = numberValue(value);
+  if (numeric === null) {
+    return fallback;
+  }
+  const rounded = Math.round(numeric);
+  return rounded <= 0 ? fallback : rounded;
+}
+
 function secondsToMinutes(value, fallback) {
   const numeric = numberValue(value);
   if (numeric === null) {
@@ -669,7 +695,7 @@ function settingsFromPreviewJson(payload) {
     settings.longitude_range = `${query.minlongitude}, ${query.maxlongitude}`;
   }
   if (eventSearch.limit_events !== undefined && eventSearch.limit_events !== null) {
-    settings.limit_events = String(eventSearch.limit_events);
+    settings.limit_events = Number(eventSearch.limit_events) > 0 ? String(eventSearch.limit_events) : "";
   }
   if (Array.isArray(eventSearch.selected_event_tokens)) {
     settings.selected_event_tokens = eventSearch.selected_event_tokens.join("\n");
@@ -800,7 +826,7 @@ function settingsFromTomlConfig(payload) {
     settings.longitude_range = `${query.minlongitude}, ${query.maxlongitude}`;
   }
   if (eventSearch.limit !== undefined) {
-    settings.limit_events = String(eventSearch.limit);
+    settings.limit_events = Number(eventSearch.limit) > 0 ? String(eventSearch.limit) : "";
   }
   if (Array.isArray(eventSearch.selected_event_tokens)) {
     settings.selected_event_tokens = eventSearch.selected_event_tokens.join("\n");
@@ -1159,7 +1185,8 @@ function buildTomlConfig(flat) {
   const [minLatitude, maxLatitude] = rangePair(flat.latitude_range, [-90, 90]);
   const [minLongitude, maxLongitude] = rangePair(flat.longitude_range, [-180, 180]);
   const selectedEventTokenList = selectedEventTokens(flat);
-  const normalizedLimit = tomlLimitValue(flat.limit_events, 20);
+  const normalizedLimit = tomlLimitValue(flat.limit_events, 0);
+  const queryLimit = queryLimitValue(flat.limit_events, 20000);
   const resolvedQuery = resolveDatasetQuery(flat);
   const metadataOnly = Boolean(flat.metadata_only);
   const windowStartPhase = flat.window_start_phase ?? "";
@@ -1185,11 +1212,12 @@ function buildTomlConfig(flat) {
     `minlongitude = ${resolvedQuery.minlongitude ?? minLongitude}`,
     `maxlongitude = ${resolvedQuery.maxlongitude ?? maxLongitude}`,
     'orderby = "time-asc"',
-    "limit = 500",
+    `limit = ${queryLimit}`,
     'output = "text"',
     "",
     "[request]",
     `channels = ${tomlString(flat.channel_patterns || "BH?")}`,
+    `channel_selection_mode = ${tomlString(flat.channel_selection_mode || "preferred")}`,
     `networks = ${tomlString(flat.network_patterns || "")}`,
     `stations = ${tomlString(flat.station_patterns || "")}`,
     `location_priority = ${tomlString(flat.location_priority || "00,--,10")}`,
@@ -1407,6 +1435,106 @@ function eventRegion(event) {
 
 function currentResultEventIds() {
   return new Set(latestEventResults.map((event) => event.output_event_id).filter(Boolean));
+}
+
+function normalizeEventToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function eventLookupTokens(event) {
+  const timeText = String(event?.event_time_utc || "").trim();
+  const dateText = timeText ? timeText.slice(0, 10) : "";
+  const compactTimeText = timeText ? timeText.replace(/[\-:TZ\s]/g, "") : "";
+  return uniqueList([
+    event?.output_event_id || "",
+    event?.event_key || "",
+    String(event?.event_id ?? ""),
+    timeText,
+    timeText.replace("T", " "),
+    dateText,
+    compactTimeText,
+  ])
+    .map((token) => normalizeEventToken(token))
+    .filter(Boolean);
+}
+
+function eventTokenMatchesCandidate(normalizedToken, normalizedCandidate) {
+  if (!normalizedToken || !normalizedCandidate) {
+    return false;
+  }
+  return (
+    normalizedCandidate === normalizedToken ||
+    normalizedCandidate.includes(normalizedToken) ||
+    normalizedToken.includes(normalizedCandidate)
+  );
+}
+
+function resolveApprovedEventIds(tokens, events) {
+  const eventEntries = (events || []).map((event) => ({
+    event,
+    lookupTokens: eventLookupTokens(event),
+  }));
+  const approvedIds = [];
+  const unmatchedTokens = [];
+
+  (tokens || []).forEach((token) => {
+    const normalizedToken = normalizeEventToken(token);
+    if (!normalizedToken) {
+      return;
+    }
+    const matches = eventEntries
+      .filter(({ lookupTokens }) => lookupTokens.some((candidate) => eventTokenMatchesCandidate(normalizedToken, candidate)))
+      .map(({ event }) => event.output_event_id)
+      .filter(Boolean);
+    if (matches.length) {
+      approvedIds.push(...matches);
+    } else {
+      unmatchedTokens.push(token);
+    }
+  });
+
+  return {
+    approvedIds: uniqueList(approvedIds),
+    unmatchedTokens,
+    inputCount: tokens.length,
+  };
+}
+
+function approveSelectedEventTokens() {
+  if (!selectedEventsStatus) {
+    return;
+  }
+  if (!latestEventResults.length) {
+    selectedEventsStatus.textContent = "请先搜索 Wilber 事件，再审批事件名单";
+    return;
+  }
+
+  const tokens = selectedEventTokens();
+  if (!tokens.length) {
+    selectedEventsStatus.textContent = "事件名单为空，请先粘贴事件名或先勾选搜索结果";
+    return;
+  }
+
+  const { approvedIds, unmatchedTokens, inputCount } = resolveApprovedEventIds(tokens, latestEventResults);
+  form.elements.selected_event_tokens.value = approvedIds.join("\n");
+  dispatchFieldInput(form.elements.selected_event_tokens);
+  refreshUi();
+  saveCurrentProfile({ announce: false });
+
+  if (approvedIds.length) {
+    const parts = [`审批完成：输入 ${inputCount} 项，命中 ${approvedIds.length} 个事件`];
+    if (unmatchedTokens.length > 0) {
+      parts.push(`未命中 ${unmatchedTokens.length} 项已跳过`);
+    }
+    selectedEventsStatus.textContent = parts.join("，");
+  } else {
+    selectedEventsStatus.textContent = unmatchedTokens.length
+      ? `审批完成，但没有在当前搜索结果中命中任何事件；未命中 ${unmatchedTokens.length} 项`
+      : "审批完成，但没有可用的事件结果";
+  }
 }
 
 function availableRegionValues() {
@@ -1955,6 +2083,12 @@ function plannedStageSequenceForFlat(flat, mode = "run_all") {
   if (mode === "resume_from_mail") {
     return workflowStageSequence({ mode: "resume_from_mail" });
   }
+  if (mode === "resume_from_mail_extract_only") {
+    return workflowStageSequence({ mode: "resume_from_mail_extract_only" });
+  }
+  if (mode === "run_until_extract") {
+    return workflowStageSequence({ mode: "run_until_extract" });
+  }
   const sequence = [
     { key: "events", label: "搜索事件" },
     { key: "stations", label: "筛选台站" },
@@ -2198,6 +2332,9 @@ async function pollWorkflowStatus() {
     if (resumeMailWorkflowButton) {
       resumeMailWorkflowButton.disabled = status === "queued" || status === "running";
     }
+    if (runUntilExtractWorkflowButton) {
+      runUntilExtractWorkflowButton.disabled = status === "queued" || status === "running";
+    }
     if (status === "queued" || status === "running") {
       if (!workflowStatusTimer) {
         workflowStatusTimer = window.setTimeout(() => {
@@ -2215,12 +2352,13 @@ async function pollWorkflowStatus() {
   }
 }
 
-async function saveWorkspaceConfig() {
+async function saveWorkspaceConfig(options = {}) {
+  const { batchModeOverride, batchIdOverride } = options;
   const flat = collectFlatSettings({ includeSensitive: true });
   clearAllFieldReminders();
   const workspaceRoot = effectiveWorkspaceRoot(flat.workspace_root);
-  const batchMode = effectiveBatchMode(flat.batch_mode);
-  const batchId = effectiveBatchId(flat.batch_id);
+  const batchMode = effectiveBatchMode(batchModeOverride ?? flat.batch_mode);
+  const batchId = effectiveBatchId(batchIdOverride ?? flat.batch_id);
   const submissionBatchId = batchMode === "new" && looksLikeAutoBatchId(batchId) ? "" : batchId;
   if (!workspaceRoot) {
     showValidationMessage("workspace_root", "请先填写工作根目录");
@@ -2309,6 +2447,9 @@ async function runWorkflow() {
   if (resumeMailWorkflowButton) {
     resumeMailWorkflowButton.disabled = true;
   }
+  if (runUntilExtractWorkflowButton) {
+    runUntilExtractWorkflowButton.disabled = true;
+  }
   try {
     const resolvedBatchId = savedConfig.batch_id || submissionBatchId;
     const payload = await postJson("/api/workflow/run", {
@@ -2332,6 +2473,75 @@ async function runWorkflow() {
     }
     if (resumeMailWorkflowButton) {
       resumeMailWorkflowButton.disabled = false;
+    }
+    if (runUntilExtractWorkflowButton) {
+      runUntilExtractWorkflowButton.disabled = false;
+    }
+  }
+}
+
+async function runUntilExtractWorkflow() {
+  const flat = collectFlatSettings({ includeSensitive: true });
+  clearAllFieldReminders();
+  const workspaceRoot = effectiveWorkspaceRoot(flat.workspace_root);
+  if (!workspaceRoot) {
+    showValidationMessage("workspace_root", "请先填写工作根目录");
+    return;
+  }
+  if (!flat.request_email) {
+    showValidationMessage("request_email", "新建批次并运行到解压时，请填写接收邮箱 / QQ邮箱");
+    return;
+  }
+  if (!flat.qq_imap_auth_code) {
+    showValidationMessage("qq_imap_auth_code", "新建批次并运行到解压时，请填写 QQ 授权码，脚本才可以检查 [Success] 邮件并下载文件");
+    return;
+  }
+
+  const savedConfig = await saveWorkspaceConfig({ batchModeOverride: "new", batchIdOverride: "" });
+  if (!savedConfig) {
+    return;
+  }
+
+  setWorkflowStatus("正在提交新批次到解压任务...");
+  renderWorkflowStagebar({
+    status: "queued",
+    mode: "run_until_extract",
+    stage_sequence: plannedStageSequenceForFlat(flat, "run_until_extract"),
+  });
+  if (runWorkflowButton) {
+    runWorkflowButton.disabled = true;
+  }
+  if (resumeMailWorkflowButton) {
+    resumeMailWorkflowButton.disabled = true;
+  }
+  if (runUntilExtractWorkflowButton) {
+    runUntilExtractWorkflowButton.disabled = true;
+  }
+  try {
+    const payload = await postJson("/api/workflow/run", {
+      workspace_root: workspaceRoot,
+      batch_mode: "new",
+      batch_id: savedConfig.batch_id || "",
+      request_email: flat.request_email,
+      qq_imap_auth_code: flat.qq_imap_auth_code,
+      config_toml: buildTomlConfig({ ...flat, submit_requests: true }),
+      mode: "run_until_extract",
+    });
+    setWorkflowStatus([payload.message || "新建批次并运行到解压任务已启动", payload.batch_id ? `批次 ${payload.batch_id}` : ""].filter(Boolean).join(" · "));
+    if (payload.batch_id && form.elements.batch_id) {
+      form.elements.batch_id.value = payload.batch_id;
+    }
+    await pollWorkflowStatus();
+  } catch (error) {
+    setWorkflowStatus(`新建批次并运行到解压启动失败: ${String(error.message || error)}`);
+    if (runWorkflowButton) {
+      runWorkflowButton.disabled = false;
+    }
+    if (resumeMailWorkflowButton) {
+      resumeMailWorkflowButton.disabled = false;
+    }
+    if (runUntilExtractWorkflowButton) {
+      runUntilExtractWorkflowButton.disabled = false;
     }
   }
 }
@@ -2375,6 +2585,9 @@ async function resumeMailWorkflow() {
   if (resumeMailWorkflowButton) {
     resumeMailWorkflowButton.disabled = true;
   }
+  if (runUntilExtractWorkflowButton) {
+    runUntilExtractWorkflowButton.disabled = true;
+  }
   try {
     const payload = await postJson("/api/workflow/resume-mail", {
       workspace_root: workspaceRoot,
@@ -2395,6 +2608,9 @@ async function resumeMailWorkflow() {
     }
     if (resumeMailWorkflowButton) {
       resumeMailWorkflowButton.disabled = false;
+    }
+    if (runUntilExtractWorkflowButton) {
+      runUntilExtractWorkflowButton.disabled = false;
     }
   }
 }
@@ -2608,7 +2824,7 @@ function buildSearchQueryString(flat) {
       params.set(key, String(value));
     }
   });
-  params.set("limit", String(optionalLimitValue(flat.limit_events) || 200));
+  params.set("limit", String(queryLimitValue(flat.limit_events, 20000)));
   return params.toString();
 }
 
@@ -2711,8 +2927,10 @@ function bindEventListeners() {
     }
   });
   searchEventsButton.addEventListener("click", searchWilberEvents);
+  approveSelectedEventsButton?.addEventListener("click", approveSelectedEventTokens);
   runWorkflowButton?.addEventListener("click", runWorkflow);
   resumeMailWorkflowButton?.addEventListener("click", resumeMailWorkflow);
+  runUntilExtractWorkflowButton?.addEventListener("click", runUntilExtractWorkflow);
   networkSelectVisibleButton?.addEventListener("click", selectVisibleNetworkCatalogEntries);
   networkClearSelectionButton?.addEventListener("click", () => setNetworkPatterns([]));
   networkCloseDropdownButton?.addEventListener("click", () => {

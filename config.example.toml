@@ -22,6 +22,7 @@ output = "text"
 channels = "BH?"
 networks = ""
 stations = ""
+station_selection_backend = "python"
 location_priority = "00,--,10"
 min_distance_deg = 35.0
 max_distance_deg = 95.0
@@ -64,13 +65,23 @@ chunk_size_bytes = 1048576
 timeout = 120
 
 [normalize]
-pre_filt = "0.002,0.005,2.0,4.0"
+pre_filt = "0.01,0.05,4.0,4.9"
 output_unit = "VEL"
 routing_type = "earthscope-federator"
 response_backend = "local_sac_first"
+zero_threshold = 1e-12
+despike_mode = "hampel"
+despike_window = 11
+despike_nsigma = 8.0
+keep_only_preferred_location = true
 overwrite = false
 selected_event_ids = []
 limit_events = 0
+
+[dedup]
+# 跨频带去重：normalize 后同一台站保留一个优先 Z 分量（BHZ>HHZ>SHZ>EHZ>DHZ>MHZ>LHZ>VHZ>UHZ，固定）。
+# 同渠道多 location 时按 request.location_priority 选一个。被移除文件移至 07_final/events/_dedup_dropped/<event_id>/。
+enabled = true
 
 [notify]
 feishu_webhook_url = ""

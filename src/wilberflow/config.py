@@ -26,6 +26,8 @@ class RequestConfig:
     channels: str = "BHZ"
     networks: str = ""
     stations: str = ""
+    channel_selection_mode: str = "preferred"
+    station_selection_backend: str = "python"
     location_priority: str = "00,--,10"
     min_distance_deg: float = 35.0
     max_distance_deg: float = 95.0
@@ -72,17 +74,33 @@ class DownloadConfig:
     overwrite: bool = False
     chunk_size_bytes: int = 1024 * 1024
     timeout: int = 120
+    retry_attempts: int = 3
+    retry_sleep_seconds: float = 2.0
+    final_retry_timeout: int = 600
 
 
 @dataclass(frozen=True)
 class NormalizeConfig:
-    pre_filt: str = "0.002,0.005,2.0,4.0"
+    pre_filt: str = "0.01,0.05,4.0,4.9"
     output_unit: str = "VEL"
     routing_type: str = "earthscope-federator"
     response_backend: str = "local_sac_first"
+    zero_threshold: float = 1e-12
+    despike_mode: str = "hampel"
+    despike_window: int = 11
+    despike_nsigma: float = 8.0
+    keep_only_preferred_location: bool = True
     overwrite: bool = False
     selected_event_ids: tuple[str, ...] = ()
     limit_events: int | None = None
+
+
+@dataclass(frozen=True)
+class DedupConfig:
+    # Cross-band dedup stage: keep one Z component per station after normalize.
+    # Channel priority is fixed (BHZ>HHZ>SHZ>EHZ>DHZ>MHZ>LHZ>VHZ>UHZ); this switch
+    # only toggles the whole stage on/off (escape hatch for debugging/rollback).
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -100,6 +118,7 @@ class PipelineConfig:
     mail: MailConfig
     download: DownloadConfig
     normalize: NormalizeConfig
+    dedup: DedupConfig
     notify: NotifyConfig
 
 
@@ -138,6 +157,7 @@ def load_config(path: Path) -> PipelineConfig:
     mail_data = _section(data, "mail")
     download_data = _section(data, "download")
     normalize_data = _section(data, "normalize")
+    dedup_data = _section(data, "dedup")
     notify_data = _section(data, "notify")
 
     query = event_search_data.get("query", {})
@@ -159,6 +179,8 @@ def load_config(path: Path) -> PipelineConfig:
             channels=normalize_filter_text(str(request_data.get("channels", "BHZ"))),
             networks=str(request_data.get("networks", "")),
             stations=str(request_data.get("stations", "")),
+            channel_selection_mode=str(request_data.get("channel_selection_mode", "preferred")).strip() or "preferred",
+            station_selection_backend=str(request_data.get("station_selection_backend", "python")).strip() or "python",
             location_priority=str(request_data.get("location_priority", "00,--,10")),
             min_distance_deg=float(request_data.get("min_distance_deg", 35.0)),
             max_distance_deg=float(request_data.get("max_distance_deg", 95.0)),
@@ -201,15 +223,26 @@ def load_config(path: Path) -> PipelineConfig:
             overwrite=bool(download_data.get("overwrite", False)),
             chunk_size_bytes=int(download_data.get("chunk_size_bytes", 1024 * 1024)),
             timeout=int(download_data.get("timeout", 120)),
+            retry_attempts=int(download_data.get("retry_attempts", 3)),
+            retry_sleep_seconds=float(download_data.get("retry_sleep_seconds", 2.0)),
+            final_retry_timeout=int(download_data.get("final_retry_timeout", 600)),
         ),
         normalize=NormalizeConfig(
-            pre_filt=str(normalize_data.get("pre_filt", "0.002,0.005,2.0,4.0")),
+            pre_filt=str(normalize_data.get("pre_filt", "0.01,0.05,4.0,4.9")),
             output_unit=str(normalize_data.get("output_unit", "VEL")),
             routing_type=str(normalize_data.get("routing_type", "earthscope-federator")),
             response_backend=str(normalize_data.get("response_backend", "local_sac_first")),
+            zero_threshold=float(normalize_data.get("zero_threshold", 1e-12)),
+            despike_mode=str(normalize_data.get("despike_mode", "hampel")),
+            despike_window=int(normalize_data.get("despike_window", 11)),
+            despike_nsigma=float(normalize_data.get("despike_nsigma", 8.0)),
+            keep_only_preferred_location=bool(normalize_data.get("keep_only_preferred_location", True)),
             overwrite=bool(normalize_data.get("overwrite", False)),
             selected_event_ids=_string_items(normalize_data.get("selected_event_ids")),
             limit_events=_optional_positive_int(normalize_data.get("limit_events")),
+        ),
+        dedup=DedupConfig(
+            enabled=bool(dedup_data.get("enabled", True)),
         ),
         notify=NotifyConfig(
             feishu_webhook_url=str(notify_data.get("feishu_webhook_url", "")).strip(),

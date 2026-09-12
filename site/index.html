@@ -107,9 +107,9 @@
                     <span>经度范围</span>
                     <input name="longitude_range" type="text" placeholder="-180, 180" />
                   </label>
-                  <label class="field">
+                  <label class="field" data-help-key="limit_events">
                     <span>限制事件数量</span>
-                    <input name="limit_events" type="number" step="1" min="0" placeholder="0 表示不限制" />
+                    <input name="limit_events" type="number" step="1" min="0" placeholder="留空表示全部匹配事件" />
                   </label>
                   <label class="field">
                     <span>事件名单（可手动增删）</span>
@@ -120,7 +120,10 @@
                     ></textarea>
                   </label>
                   <div class="field span-full action-field">
-                    <div class="mini-status" id="selected-events-status">搜索后会默认全选结果，并同步写入事件名单</div>
+                    <div class="inline-actions">
+                      <button class="button button-secondary" id="approve-selected-events" type="button">审批事件名单</button>
+                      <div class="mini-status" id="selected-events-status">搜索后会默认全选结果，并同步写入事件名单</div>
+                    </div>
                   </div>
                   <input name="selected_regions" type="hidden" />
                   <label class="field span-full" data-help-key="selected_regions">
@@ -198,8 +201,15 @@
                     </div>
                   </label>
                   <label class="field">
+                    <span>通道保留模式</span>
+                    <select name="channel_selection_mode">
+                      <option value="preferred">每台站只保留一个优先通道</option>
+                      <option value="all_matching">保留该台站所有匹配通道</option>
+                    </select>
+                  </label>
+                  <label class="field">
                     <span>location 优先级</span>
-                    <input name="location_priority" type="text" placeholder="00,--,10" />
+                    <input name="location_priority" type="text" placeholder="留空表示全部下载" />
                   </label>
                   <label class="field">
                     <span>最小震中距</span>
@@ -311,6 +321,7 @@
                       <button class="button button-secondary" id="save-workspace-config" type="button">保存当前配置到工作目录</button>
                       <button class="button button-primary" id="run-workflow" type="button">提交并开始流程</button>
                       <button class="button button-secondary" id="resume-mail-workflow" type="button">补跑收信与下载</button>
+                      <button class="button button-secondary" id="run-until-extract-workflow" type="button">新建批次并运行到解压</button>
                     </div>
                   </div>
                 </div>

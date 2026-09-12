@@ -5,7 +5,8 @@ import shutil
 from pathlib import Path
 from typing import Callable
 
-from .common import ensure_dir, write_csv, write_json, write_key_value_csv
+from .common import DEDUP_DROPPED_DIR_NAME, ensure_dir, write_csv, write_json, write_key_value_csv
+from .readme import generate_delivery_readme
 
 
 SUMMARY_FILES = [
@@ -14,6 +15,7 @@ SUMMARY_FILES = [
     "skipped_extra_channels.csv",
     "summary.csv",
     "summary.json",
+    "dedup_summary.csv",
 ]
 FINAL_ROOT_NAME = "07_final"
 DELIVERY_EVENTS_DIR_NAME = "events"
@@ -29,7 +31,10 @@ def _copy_event_tree(
     ensure_dir(event_root)
     event_dirs = 0
     sac_files = 0
-    source_event_dirs = sorted(path for path in source_events_root.iterdir() if path.is_dir())
+    source_event_dirs = sorted(
+        path for path in source_events_root.iterdir()
+        if path.is_dir() and path.name != DEDUP_DROPPED_DIR_NAME
+    )
     total_event_dirs = len(source_event_dirs)
     if progress_callback is not None:
         progress_callback("deliver", 0, total_event_dirs, "等待整理交付目录", "running")
@@ -91,7 +96,10 @@ def export_final_layout(
     source_events_resolved = source_events_root.resolve()
     event_root_resolved = event_root.resolve()
     if source_events_resolved == event_root_resolved:
-        source_event_dirs = sorted(path for path in source_events_root.iterdir() if path.is_dir())
+        source_event_dirs = sorted(
+        path for path in source_events_root.iterdir()
+        if path.is_dir() and path.name != DEDUP_DROPPED_DIR_NAME
+    )
         event_dirs = len(source_event_dirs)
         sac_files = sum(1 for event_dir in source_event_dirs for path in event_dir.iterdir() if path.is_file())
         if progress_callback is not None:
@@ -121,6 +129,8 @@ def export_final_layout(
     }
     write_json(metadata_root / "export_summary.json", payload)
     write_key_value_csv(metadata_root / "export_summary.csv", payload)
+    # Chinese overview README at the 07_final delivery root (parent of events/ and metadata/).
+    generate_delivery_readme(workspace_root, event_root.parent, logger)
     if progress_callback is not None:
         progress_callback("deliver", total_steps, total_steps, f"整理交付完成：metadata {total_steps}/{total_steps}", "completed")
     return payload

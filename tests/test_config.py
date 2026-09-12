@@ -10,7 +10,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from wilberflow.common import normalize_filter_text, parse_filter_tokens
+from wilberflow.common import DEFAULT_EVENT_SERVICE_URL, normalize_filter_text, parse_filter_tokens
 from wilberflow.config import load_config
 
 
@@ -46,9 +46,56 @@ notify_on_failure = false
             config = load_config(config_path)
 
         self.assertEqual(config.request.channels, "BH?,?HZ")
+        self.assertEqual(config.request.station_selection_backend, "python")
+        self.assertEqual(config.normalize.despike_mode, "hampel")
+        self.assertTrue(config.normalize.keep_only_preferred_location)
         self.assertEqual(config.notify.feishu_webhook_url, "https://example.com/hook")
         self.assertTrue(config.notify.notify_on_success)
         self.assertFalse(config.notify.notify_on_failure)
+
+    def test_load_config_reads_request_station_selection_backend(self) -> None:
+        config_text = """
+[event_search]
+
+[request]
+station_selection_backend = "wilber_page"
+
+[mail]
+
+[download]
+
+[normalize]
+
+[notify]
+"""
+        with tempfile.TemporaryDirectory() as tmpdir_text:
+            config_path = Path(tmpdir_text) / "config.toml"
+            config_path.write_text(config_text, encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertEqual(config.request.station_selection_backend, "wilber_page")
+
+    def test_load_config_uses_live_wilber_event_service_by_default(self) -> None:
+        config_text = """
+[event_search]
+
+[request]
+
+[mail]
+
+[download]
+
+[normalize]
+
+[notify]
+"""
+        with tempfile.TemporaryDirectory() as tmpdir_text:
+            config_path = Path(tmpdir_text) / "config.toml"
+            config_path.write_text(config_text, encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertEqual(config.event_search.event_service_url, DEFAULT_EVENT_SERVICE_URL)
+        self.assertEqual(config.event_search.event_service_url, "https://ds.iris.edu/ws-event-int/query")
 
 
 if __name__ == "__main__":

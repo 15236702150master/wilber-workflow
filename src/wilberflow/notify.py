@@ -29,7 +29,13 @@ def build_feishu_workflow_message(
     detail: str,
 ) -> str:
     status_text = "成功" if status == "completed" else "失败"
-    mode_text = "完整流程" if mode == "run_all" else "补跑收信与下载"
+    mode_text_map = {
+        "run_all": "完整流程",
+        "run_until_extract": "新建批次并运行到解压",
+        "resume_from_mail": "补跑收信与下载",
+        "resume_from_mail_extract_only": "只下载后解压",
+    }
+    mode_text = mode_text_map.get(mode, mode)
     lines = [
         f"WilberFlow 运行{status_text}",
         f"批次号：{batch_id or '未记录'}",

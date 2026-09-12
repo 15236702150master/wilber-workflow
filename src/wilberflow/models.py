@@ -81,6 +81,7 @@ class SelectedStation:
     azimuth: float
     back_azimuth: float
     selected_location_code: str
+    channel_selection_mode: str
     selected_channels: tuple[str, ...]
     selected_channel_count: int
     matching_location_codes: tuple[str, ...]

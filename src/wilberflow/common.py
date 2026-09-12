@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import fnmatch
+from http.client import IncompleteRead
 import json
 import logging
 import os
@@ -18,10 +19,14 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 from obspy import UTCDateTime
 
 
-DEFAULT_EVENT_SERVICE_URL = "https://service.iris.edu/fdsnws/event/1/query"
+DEFAULT_EVENT_SERVICE_URL = "https://ds.iris.edu/ws-event-int/query"
 DEFAULT_WILBER_BASE_URL = "https://ds.iris.edu/wilber3"
 DEFAULT_USER_AGENT = "winner-wilber-workflow/0.1"
 WINDOWS_DRIVE_PATTERN = re.compile(r"^(?P<drive>[A-Za-z]):[\\/](?P<rest>.*)$")
+
+# Subdirectory under 07_final/events that holds cross-band dedup overflow files.
+# Shared by dedup.py (writes here) and export_final.py (excludes from delivery).
+DEDUP_DROPPED_DIR_NAME = "_dedup_dropped"
 
 
 def ensure_dir(path: Path) -> Path:
@@ -122,7 +127,7 @@ def http_get_text(
         try:
             with opener.open(final_url, timeout=timeout) as response:
                 return response.read().decode("utf-8")
-        except (URLError, TimeoutError, OSError) as exc:
+        except (URLError, TimeoutError, OSError, IncompleteRead) as exc:
             last_error = exc
             if attempt >= max(1, retry_attempts):
                 raise
@@ -153,7 +158,7 @@ def http_post_form(
                     request.add_header(key, value)
             with opener.open(request, timeout=timeout) as response:
                 return response.getcode(), response.read().decode("utf-8")
-        except (URLError, TimeoutError, OSError) as exc:
+        except (URLError, TimeoutError, OSError, IncompleteRead) as exc:
             last_error = exc
             if attempt >= max(1, retry_attempts):
                 raise

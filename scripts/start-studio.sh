@@ -7,6 +7,7 @@ PID_FILE="$PID_DIR/serve.pid"
 LOG_FILE="$PID_DIR/serve.log"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8765}"
+BRIDGE_STARTER="$ROOT_DIR/scripts/start-bridge.sh"
 
 mkdir -p "$PID_DIR"
 
@@ -18,10 +19,19 @@ fi
 if [ -f "$PID_FILE" ]; then
   OLD_PID="$(cat "$PID_FILE")"
   if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
+    if [ -f "$BRIDGE_STARTER" ]; then
+      echo "checking browser bridge..."
+      bash "$BRIDGE_STARTER"
+    fi
     echo "studio already running at http://$HOST:$PORT (pid=$OLD_PID)"
     exit 0
   fi
   rm -f "$PID_FILE"
+fi
+
+if [ -f "$BRIDGE_STARTER" ]; then
+  echo "checking browser bridge..."
+  bash "$BRIDGE_STARTER"
 fi
 
 cd "$ROOT_DIR"

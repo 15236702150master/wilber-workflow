@@ -4,11 +4,13 @@ from pathlib import Path
 from typing import Callable
 
 from .config import PipelineConfig, copy_config_into_workspace
+from .dedup import dedup_workspace
 from .downloads import download_packages, extract_packages
 from .export_final import default_export_roots, export_final_layout
 from .mail import MailProgressCallback, poll_success_mail
 from .normalize import normalize_workspace
 from .wilber import build_requests, fetch_and_select_stations, query_events
+from .wilber import normalize_station_selection_backend
 
 StageCallback = Callable[[str, str], None]
 StageProgressCallback = Callable[[str, int | None, int | None, str | None, str | None, dict[str, object] | None], None]
@@ -21,19 +23,33 @@ WORKFLOW_STAGE_DEFINITIONS: dict[str, dict[str, str]] = {
     "download": {"key": "download", "label": "下载数据", "message": "正在下载 Wilber 数据包"},
     "extract": {"key": "extract", "label": "解压数据", "message": "正在解压原始数据包"},
     "response": {"key": "response", "label": "去仪器响应", "message": "正在去仪器响应"},
+    "dedup": {"key": "dedup", "label": "跨频带去重", "message": "正在跨频带去重"},
     "deliver": {"key": "deliver", "label": "整理交付", "message": "正在整理最终交付目录"},
 }
 
 
+def _uses_official_wilber_page_selection(pipeline_config: PipelineConfig) -> bool:
+    return normalize_station_selection_backend(pipeline_config.request.station_selection_backend) == "wilber_page"
+
+
 def workflow_stage_sequence(pipeline_config: PipelineConfig, mode: str = "run_all") -> list[dict[str, str]]:
     if mode == "resume_from_mail":
-        stage_keys = ["mail", "download", "extract", "response", "deliver"]
+        stage_keys = ["mail", "download", "extract", "response", "dedup", "deliver"]
+    elif mode == "resume_from_mail_extract_only":
+        stage_keys = ["mail", "download", "extract"]
+    elif mode == "run_until_extract":
+        stage_keys = ["events"]
+        if not _uses_official_wilber_page_selection(pipeline_config):
+            stage_keys.append("stations")
+        stage_keys.extend(["requests", "mail", "download", "extract"])
     else:
-        stage_keys = ["events", "stations"]
-        if not pipeline_config.request.metadata_only:
+        stage_keys = ["events"]
+        if not _uses_official_wilber_page_selection(pipeline_config):
+            stage_keys.append("stations")
+        if _uses_official_wilber_page_selection(pipeline_config) or not pipeline_config.request.metadata_only:
             stage_keys.append("requests")
             if pipeline_config.request.submit:
-                stage_keys.extend(["mail", "download", "extract", "response", "deliver"])
+                stage_keys.extend(["mail", "download", "extract", "response", "dedup", "deliver"])
     return [dict(WORKFLOW_STAGE_DEFINITIONS[key]) for key in stage_keys]
 
 
@@ -113,6 +129,15 @@ def run_normalize(
     normalize_workspace(workspace_root, pipeline_config, logger, progress_callback=response_progress_callback)
 
 
+def run_dedup(
+    workspace_root: Path,
+    pipeline_config: PipelineConfig,
+    logger,
+    progress_callback: StageProgressCallback | None = None,
+) -> None:
+    dedup_workspace(workspace_root, pipeline_config, logger, progress_callback=progress_callback)
+
+
 def run_delivery_export(
     workspace_root: Path,
     logger,
@@ -145,8 +170,51 @@ def run_resume_from_mail(
     run_extraction(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
     _enter_stage(stage_callback, "response")
     run_normalize(workspace_root, pipeline_config, logger, response_progress_callback=stage_progress_callback)
+    _enter_stage(stage_callback, "dedup")
+    run_dedup(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
     _enter_stage(stage_callback, "deliver")
     run_delivery_export(workspace_root, logger, progress_callback=stage_progress_callback)
+
+
+def run_download_extract_only(
+    workspace_root: Path,
+    pipeline_config: PipelineConfig,
+    logger,
+    stage_callback: StageCallback | None = None,
+    mail_progress_callback: MailProgressCallback | None = None,
+    stage_progress_callback: StageProgressCallback | None = None,
+) -> None:
+    _enter_stage(stage_callback, "mail")
+    run_mail_polling(workspace_root, pipeline_config, logger, progress_callback=mail_progress_callback)
+    _enter_stage(stage_callback, "download")
+    run_package_download(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    _enter_stage(stage_callback, "extract")
+    run_extraction(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+
+
+def run_until_extract(
+    workspace_root: Path,
+    pipeline_config: PipelineConfig,
+    logger,
+    stage_callback: StageCallback | None = None,
+    mail_progress_callback: MailProgressCallback | None = None,
+    stage_progress_callback: StageProgressCallback | None = None,
+) -> None:
+    _enter_stage(stage_callback, "events")
+    run_search(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    if not _uses_official_wilber_page_selection(pipeline_config):
+        _enter_stage(stage_callback, "stations")
+        run_station_selection(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    else:
+        logger.info("station_selection_backend=wilber_page; skipping local station selection in run-until-extract")
+    _enter_stage(stage_callback, "requests")
+    run_request_submission(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    _enter_stage(stage_callback, "mail")
+    run_mail_polling(workspace_root, pipeline_config, logger, progress_callback=mail_progress_callback)
+    _enter_stage(stage_callback, "download")
+    run_package_download(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    _enter_stage(stage_callback, "extract")
+    run_extraction(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
 
 
 def run_all(
@@ -159,12 +227,23 @@ def run_all(
 ) -> None:
     _enter_stage(stage_callback, "events")
     run_search(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
-    _enter_stage(stage_callback, "stations")
-    run_station_selection(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    uses_official_page = _uses_official_wilber_page_selection(pipeline_config)
+    if not uses_official_page:
+        _enter_stage(stage_callback, "stations")
+        run_station_selection(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+    else:
+        logger.info("station_selection_backend=wilber_page; skipping local station selection in run-all")
     if pipeline_config.request.metadata_only:
-        logger.info(
-            "metadata_only enabled; stopping after station selection with 01_events and 02_stations outputs",
-        )
+        if uses_official_page:
+            _enter_stage(stage_callback, "requests")
+            run_request_submission(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
+            logger.info(
+                "metadata_only enabled with wilber_page backend; stopping after 01_events and 03_requests outputs",
+            )
+        else:
+            logger.info(
+                "metadata_only enabled; stopping after station selection with 01_events and 02_stations outputs",
+            )
         return
     _enter_stage(stage_callback, "requests")
     run_request_submission(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
@@ -181,5 +260,7 @@ def run_all(
     run_extraction(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
     _enter_stage(stage_callback, "response")
     run_normalize(workspace_root, pipeline_config, logger, response_progress_callback=stage_progress_callback)
+    _enter_stage(stage_callback, "dedup")
+    run_dedup(workspace_root, pipeline_config, logger, progress_callback=stage_progress_callback)
     _enter_stage(stage_callback, "deliver")
     run_delivery_export(workspace_root, logger, progress_callback=stage_progress_callback)

@@ -81,6 +81,8 @@ http://127.0.0.1:8765
   </tr>
 </table>
 
+阅读顺序建议是：先看总览图理解 `events → stations → requests → mail → download → response → deliver`，再看四张配置台截图。顶部截图说明如何保存 profile 和启动批次；事件、台站、请求与批次截图分别对应筛选范围、通道选择以及邮件轮询和断点续跑参数。
+
 ## 目录
 
 - [一句话理解这个项目](#一句话理解这个项目)
@@ -200,6 +202,10 @@ QQ_IMAP_AUTH_CODE=your_mail_auth_code
 bash scripts/start-studio.sh
 ```
 
+这一步现在也会尝试同步拉起 Windows Chrome CDP bridge。
+如果桥还没开，会弹一次 Windows UAC 管理员确认，用来创建 `9223 -> 9222` 端口桥并启动专用 debug Chrome。
+默认以后台方式触发 bridge，不会长期占住前台 shell；脚本只在后台轮询 bridge 是否 ready。
+
 启动后浏览器打开：
 
 ```text
@@ -211,6 +217,8 @@ http://127.0.0.1:8765
 ```bash
 bash scripts/stop-studio.sh
 ```
+
+停止时也会同步关闭 bridge，并清理专用 debug Chrome、端口转发和防火墙规则。
 
 ## 依赖与工具说明
 
@@ -511,6 +519,9 @@ wf_20260405_214649
 
   这里不是只能从下拉预设里选。
   下拉只是把 Wilber 常见分类做成快捷入口，你也可以像官方页面一样直接手输别的通道模式，例如 `?HZ`，或写多个模式如 `BH?,?HZ`。
+  这些模式先用来找“候选通道”。
+  真正提交 Wilber 请求时，程序会对每个台站只保留当前能拿到的最佳通道，再用 `location priority` 只在同级候选里做 tie-break。
+  例如写 `?HZ` 时，如果某站同时有 `BHZ` 和 `LHZ`，最终会只请求 `BHZ`，不会把低优先级垂直通道一起下载。
 
 - `location priority` 是什么？
   同一个台站有多个 location code 时，优先选哪一个。
